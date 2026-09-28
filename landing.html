@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f4f5ef" />
+    <meta name="description" content="Code with me — настольное приложение для совместного решения задач по программированию. Создайте комнату, пригласите команду и пишите код вместе." />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23111318'/%3E%3Cpath d='M10 29V20m10 9V11m10 18V15' stroke='%23a5efbd' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <title>Code with me — решайте задачи вместе</title>
+    <link rel="stylesheet" href="./landing.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Code with me — на главную">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>code<span class="brand-light">with</span>me</span>
+      </a>
+      <nav class="main-nav" aria-label="Основная навигация">
+        <a href="#about">О проекте</a>
+        <a href="#how">Как пользоваться</a>
+        <a href="#rooms">Комнаты</a>
+      </nav>
+      <a class="header-link" href="#how">Посмотреть, как это работает <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="top">
+      <section class="hero section-wrap">
+        <div class="hero-copy">
+          <div class="eyebrow"><span class="eyebrow-dot"></span> Совместное программирование</div>
+          <h1>Разбирайте задачи<br />и пишите код <em>вместе.</em></h1>
+          <p class="hero-lede">Code with me — настольное приложение, в котором команда решает задачу, обсуждает код и запускает его в одной общей комнате.</p>
+          <a class="button button-dark" href="#how">Как начать <span aria-hidden="true">↓</span></a>
+          <div class="hero-note"><span class="note-check" aria-hidden="true">✓</span> Комната создаётся на компьютере одного из участников</div>
+        </div>
+
+        <div class="preview-wrap" aria-label="Пример комнаты с заданием и редактором кода">
+          <div class="preview-label"><span></span> Так выглядит совместная работа</div>
+          <div class="app-preview">
+            <div class="preview-topbar">
+              <span class="mini-brand"><b>c</b> code<span>with</span>me</span>
+              <span class="preview-room">Алгоритмы · занятие 04 <i></i></span>
+              <span class="preview-online"><i></i> 3 участника</span>
+            </div>
+            <div class="preview-body">
+              <aside class="preview-tasks" aria-label="Задания">
+                <span class="preview-task-index active">0</span>
+                <span class="preview-task-index">1</span>
+                <span class="preview-task-index">2</span>
+                <span class="preview-task-add">++</span>
+              </aside>
+              <section class="preview-task">
+                <div class="preview-cap"><i>✳</i> УСЛОВИЕ <span class="preview-modes">Форма&nbsp; Редактор&nbsp; <b>Предпросмотр</b></span></div>
+                <small>Массивы · Два указателя</small>
+                <h2>Пара с заданной суммой</h2>
+                <div class="preview-rule"></div>
+                <p>Дан отсортированный массив целых чисел <code>numbers</code>. Найдите два числа, сумма которых равна <code>target</code>.</p>
+                <div class="preview-example"><small>ПРИМЕР</small><code>numbers = [2, 7, 11, 15]</code><code>target = 9 → [1, 2]</code></div>
+              </section>
+              <section class="preview-editor">
+                <div class="preview-cap"><i class="purple-dot"></i> КОД <span class="editing"><i></i> Максим редактирует</span></div>
+                <div class="preview-tabs"><b>0.solution-0</b><span class="preview-tab-avatar">М</span><i></i></div>
+                <div class="code-lines" aria-hidden="true">
+                  <span>1</span><code><i>def</i> two_sum(numbers, target):</code>
+                  <span>2</span><code>    left = <b>0</b></code>
+                  <span>3</span><code>    right = len(numbers) - <b>1</b></code>
+                  <span>4</span><code></code>
+                  <span>5</span><code>    <i>while</i> left &lt; right:</code>
+                  <span>6</span><code>        total = numbers[left] + numbers[right]</code>
+                  <span>7</span><code>        <i>if</i> total == target:</code>
+                  <span>8</span><code>            <u>return</u> [left + <b>1</b>, right + <b>1</b>]</code>
+                  <span>9</span><code>        <i>elif</i> total &lt; target:</code>
+                  <span>10</span><code>            left += <b>1</b></code>
+                </div>
+                <div class="preview-output"><b><i></i> ВЫВОД</b><small>Нажмите «Запустить», чтобы проверить решение.</small></div>
+              </section>
+            </div>
+          </div>
+          <div class="preview-footnote"><span class="footnote-avatars"><i>А</i><i>М</i><i>И</i></span> Задание и редактор — рядом</div>
+        </div>
+        <div class="hero-ornament" aria-hidden="true">{ }</div>
+      </section>
+
+      <section class="about section-wrap" id="about">
+        <div class="section-intro">
+          <span class="section-index">01 / ЧТО ЭТО</span>
+          <h2>Рабочее место<br />для задач <em>в команде.</em></h2>
+        </div>
+        <div class="about-copy">
+          <p>Откройте общее занятие, прочитайте условие и решайте задачу вместе: изменения в коде видны участникам комнаты, а запуск программы проверяет решение на компьютере её создателя.</p>
+          <div class="feature-row">
+            <article class="feature"><span class="feature-icon mint" aria-hidden="true">⌘</span><div><h3>Одна комната</h3><p>До 10 участников работают с заданиями и отдельными вкладками решений.</p></div></article>
+            <article class="feature"><span class="feature-icon lilac" aria-hidden="true">{ }</span><div><h3>Задание под рукой</h3><p>Условие, примеры, подсказка и код открыты в одном окне.</p></div></article>
+            <article class="feature"><span class="feature-icon amber" aria-hidden="true">▶</span><div><h3>Запуск на месте</h3><p>Проверяйте решение, не переключаясь между приложениями.</p></div></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="how section-wrap" id="how">
+        <div class="how-heading">
+          <div><span class="section-index">02 / КАК ПОЛЬЗОВАТЬСЯ</span><h2>От условия<br />до решения — <em>вместе.</em></h2></div>
+          <p>Один участник становится хостом комнаты и приглашает остальных. У всех под рукой одно занятие с задачами и решениями.</p>
+        </div>
+        <div class="steps">
+          <article class="step-card"><span class="step-number">01</span><div class="step-icon icon-room" aria-hidden="true"><i></i><i></i><i></i></div><h3>Создайте комнату</h3><p>Подготовьте занятие и запустите комнату на своём компьютере.</p><span class="step-meta">На компьютере хоста</span></article>
+          <span class="step-arrow" aria-hidden="true">→</span>
+          <article class="step-card"><span class="step-number">02</span><div class="step-icon icon-task" aria-hidden="true">✳</div><h3>Добавьте задание</h3><p>Заполните форму, отредактируйте Markdown и проверьте итоговый вид условия.</p><span class="step-meta">Форма · Markdown · предпросмотр</span></article>
+          <span class="step-arrow" aria-hidden="true">→</span>
+          <article class="step-card"><span class="step-number">03</span><div class="step-icon icon-invite" aria-hidden="true"><span>↗</span><i></i></div><h3>Пригласите команду</h3><p>Отправьте ссылку-приглашение участникам в той же локальной сети.</p><span class="step-meta">До 10 человек в комнате</span></article>
+          <span class="step-arrow" aria-hidden="true">→</span>
+          <article class="step-card"><span class="step-number">04</span><div class="step-icon icon-run" aria-hidden="true">▶</div><h3>Решайте и запускайте</h3><p>Обсуждайте подход, вместе редактируйте код и запускайте программу у хоста.</p><span class="step-meta">Python · Go · C++ · Java</span></article>
+        </div>
+        <p class="network-note"><span aria-hidden="true">ⓘ</span> Комнаты доступны участникам одной локальной сети; подключение через интернет пока не настроено. Хост запускает код на своём компьютере — приглашайте только тех, кому доверяете.</p>
+      </section>
+
+      <section class="rooms section-wrap" id="rooms">
+        <div class="rooms-heading">
+          <div><span class="section-index">03 / ПУБЛИЧНЫЕ КОМНАТЫ</span><h2>Задачи от <em>сообщества.</em></h2></div>
+          <span class="coming-soon"><i></i> Скоро</span>
+        </div>
+        <div class="rooms-empty">
+          <div class="empty-art" aria-hidden="true"><span class="empty-spark">✳</span><div class="empty-card card-back"></div><div class="empty-card card-front"><i></i><i></i><i></i><b>＋</b></div></div>
+          <div class="empty-copy"><h3>Здесь появятся публичные комнаты</h3><p>Участники смогут делиться комнатами с задачами, а вы — находить интересные темы и присоединяться к решению.</p><span class="empty-status"><i></i> Каталог комнат пока готовится</span></div>
+          <div class="empty-side"><span>БУДУЩИЙ КАТАЛОГ</span><strong>Задачи<br />и комнаты</strong><small>Публикация появится позже</small></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer section-wrap">
+      <a class="brand" href="#top" aria-label="Code with me — наверх"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>code<span class="brand-light">with</span>me</span></a>
+      <p>Меньше переключений. Больше совместного кода.</p>
+      <a class="footer-top" href="#top">Наверх ↑</a>
+    </footer>
+  </body>
+</html>

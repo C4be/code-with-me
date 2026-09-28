@@ -1,0 +1,10 @@
+.workspace.task-collapsed{grid-template-columns:218px 42px minmax(420px,1fr)}
+.task-collapsed .task-content,.task-collapsed .task-footer{display:none}
+.task-collapsed .task-panel{min-width:0}
+.task-collapsed .panel-top{height:100%;flex-direction:column;justify-content:flex-start;padding:12px 0;gap:16px}
+.task-collapsed .panel-label{writing-mode:vertical-rl}
+.task-collapsed .panel-label .difficulty{display:none}
+.task-collapsed #collapse-task{transform:rotate(180deg)}
+.room-live.room-idle{color:#b1b3bb;background:#272930;border-color:#393c45}
+.room-live.room-idle i{background:#767a84;box-shadow:none}
+.button:disabled{opacity:.45;cursor:not-allowed}

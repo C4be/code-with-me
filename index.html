@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#eef0f4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#111318" media="(prefers-color-scheme: dark)" />
+    <script>
+      try {
+        const savedTheme = localStorage.getItem("code-with-me-theme");
+        document.documentElement.dataset.theme = savedTheme === "light" || savedTheme === "dark"
+          ? savedTheme
+          : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      } catch {
+        document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+    </script>
+    <title>Code with me</title>
+    <link rel="stylesheet" href="./studio.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Code with me — главная">
+          <span class="brand-mark"><i></i><i></i><i></i></span>
+          <strong>code <span>with</span> me</strong>
+        </a>
+          <span class="course-title">Алгоритмы · занятие 04</span>
+          <div class="room-actions">
+          <button class="theme-toggle" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Тёмная тема" title="Переключить светлую или тёмную тему">
+            <span class="theme-toggle-label">Тема</span><span class="theme-toggle-track"><i></i></span>
+          </button>
+          <button class="profile-button" id="profile-button" type="button" title="Изменить имя">Вы: <span id="profile-name">Участник</span></button>
+          <span class="room-state room-idle" id="room-state"><i></i><span>Локальная комната</span></span>
+          <div class="participants" id="participants" aria-label="Участники комнаты"><span class="people-count">0 / 10</span></div>
+          <button class="button secondary" id="lesson-button">Сохранить занятие</button>
+          <button class="button secondary" id="invite-button" disabled>Пригласить</button>
+          <button class="button secondary" id="start-room-button">Создать комнату</button>
+          <button class="button secondary hidden" id="stop-room-button">Остановить</button>
+          <button class="button secondary hidden" id="close-contest-button">Закрыть контест</button>
+          <button class="button primary" id="run-button">▶ Запустить</button>
+        </div>
+      </header>
+
+      <main class="home-view hidden" id="home-view">
+        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
+        <section class="home-section"><div class="home-section-heading"><h2>Мои контесты</h2><span>Созданные на этом компьютере</span></div><div class="contest-list" id="my-contest-list" aria-label="Мои контесты"></div></section>
+        <section class="home-section"><div class="home-section-heading"><h2>Сохранённые и импортированные</h2><span>Снимки занятий и загруженные контесты</span></div><div class="contest-list" id="saved-contest-list" aria-label="Сохранённые контесты"></div></section>
+        <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Компиляторы и интерпретаторы, необходимые для запуска решений на этом компьютере</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные языки…</p></div></section>
+        <input id="home-file-input" type="file" accept=".cwmroom,application/json" hidden />
+      </main>
+
+      <main class="workspace">
+        <nav class="task-rail" id="task-rail" aria-label="Задания">
+          <button class="task-index active" data-task-file="task.cwm.md" title="Задание 0">0</button>
+          <button class="task-add" id="add-task-button" title="Добавить задание" aria-label="Добавить задание">++</button>
+        </nav>
+
+        <section class="task-panel">
+          <header class="panel-header task-header">
+            <div class="panel-title"><span>УСЛОВИЕ</span><b id="task-number">ЗАДАНИЕ 0</b><button class="inline-delete" id="delete-task-button" type="button" title="Удалить задание" aria-label="Удалить задание">×</button></div>
+            <div class="mode-switch" id="task-mode-switch" aria-label="Режим условия">
+              <button data-task-mode="form">Форма</button>
+              <button data-task-mode="source">Редактор</button>
+              <button class="active" data-task-mode="preview">Предпросмотр</button>
+            </div>
+          </header>
+
+          <div class="task-view hidden" id="task-form-view">
+            <form class="task-form" id="task-form">
+              <label class="wide"><span>Название</span><input id="task-field-title" maxlength="120" /></label>
+              <label><span>Тема</span><input id="task-field-theme" maxlength="60" placeholder="Массивы" /></label>
+              <label><span>Подтема</span><input id="task-field-subtopic" maxlength="60" placeholder="Два указателя" /></label>
+              <label><span>Сложность</span><select id="task-field-difficulty"><option value="easy">Лёгкая</option><option value="medium">Средняя</option><option value="hard">Сложная</option></select></label>
+              <label><span>Минуты</span><input id="task-field-time" type="number" min="1" max="600" /></label>
+              <label><span>Язык решений</span><select id="task-field-language"><option value="python">Python</option><option value="go">Go</option><option value="cpp">C++</option><option value="java">Java</option></select></label>
+              <label class="wide body-field"><span>Текст задания · Markdown</span><textarea id="task-field-body" spellcheck="true"></textarea></label>
+            </form>
+          </div>
+
+          <div class="task-view hidden source-view" id="task-source-view">
+            <div class="source-note">Полный файл задания в формате <code>.cwm.md</code></div>
+            <textarea id="task-source-input" spellcheck="false" aria-label="Редактор задания Markdown"></textarea>
+          </div>
+
+          <div class="task-view preview-view" id="task-preview-view">
+            <div class="task-preview">
+              <div class="task-kicker" id="task-category">Массивы · Два указателя</div>
+              <div class="task-heading-row"><h1 id="task-title">Пара с заданной суммой</h1><span class="difficulty" id="task-difficulty">СРЕДНЯЯ</span></div>
+              <div class="task-meta" id="task-meta">⏱ 25 минут</div>
+              <div class="task-rule"></div>
+              <article class="task-prose" id="task-description"></article>
+            </div>
+          </div>
+          <footer class="panel-footer"><span class="save-indicator" id="task-save-state">● Сохранено</span><span>.cwm.md</span></footer>
+        </section>
+
+        <section class="editor-panel">
+          <header class="panel-header editor-header">
+            <div class="panel-title"><span>КОД</span><b id="solution-count">1 РЕШЕНИЕ</b></div>
+            <div class="editor-header-actions">
+              <span class="isolation-badge" title="Каждое решение запускается отдельно">◇ Изолированный запуск</span>
+              <button class="button secondary editor-fullscreen-button" id="editor-fullscreen-button" type="button" aria-label="Развернуть редактор на весь экран" title="Развернуть редактор на весь экран">⛶</button>
+            </div>
+          </header>
+          <div class="solution-tabs" id="solution-tabs"></div>
+          <div class="editor-context">
+            <span id="solution-breadcrumb">Задание 0</span>
+            <strong id="active-solution-name">0.solution-0</strong>
+            <label class="language-picker" for="code-language-select"><span>ЯП</span><select id="code-language-select" aria-label="Язык программирования"><option value="py">Python</option><option value="go">Go</option><option value="cpp">C++</option><option value="java">Java</option></select></label>
+            <div class="font-zoom" aria-label="Масштаб текста редактора"><button id="font-smaller" type="button" title="Уменьшить текст" aria-label="Уменьшить текст">−</button><span id="font-size-value">12 px</span><button id="font-larger" type="button" title="Увеличить текст" aria-label="Увеличить текст">＋</button></div>
+            <span class="active-editors" id="active-editors"></span>
+          </div>
+          <div class="code-wrap" id="code-wrap">
+            <div class="line-numbers" id="line-numbers"></div>
+            <div class="code-editor">
+              <pre aria-hidden="true"><code id="highlight-code"></code></pre>
+              <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Редактор кода" wrap="off"></textarea>
+              <div class="remote-cursors" id="remote-cursors" aria-hidden="true"></div>
+              <div class="suggestion hidden" id="suggestion"><strong id="suggestion-word"></strong><kbd>Tab</kbd></div>
+            </div>
+          </div>
+          <div class="output-panel" id="output-panel">
+            <div class="output-header"><strong>ТЕРМИНАЛ</strong><span id="run-result">ГОТОВО</span><small class="local-run-note">Запуск на вашем устройстве · вывод виден только вам</small><button id="clear-output" aria-label="Очистить вывод">Очистить</button></div>
+            <pre id="output-text">Нажмите «Запустить», чтобы выполнить текущее решение.</pre>
+          </div>
+          <footer class="statusbar"><span>● Синхронизировано</span><span id="cursor-position">Строка 1, столбец 1</span><span id="status-language">Python</span></footer>
+        </section>
+      </main>
+
+      <div class="toast" id="toast" role="status"></div>
+
+      <div class="modal-backdrop hidden" id="delete-modal">
+        <div class="modal-card"><div class="modal-header"><div><span>УДАЛЕНИЕ</span><h2 id="delete-title">Удалить?</h2></div><button type="button" data-close-modal="delete-modal" aria-label="Закрыть">×</button></div><p id="delete-description"></p><div class="modal-actions"><button type="button" class="button secondary" data-close-modal="delete-modal">Отмена</button><button type="button" class="button primary danger" id="confirm-delete-button">Удалить</button></div></div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="profile-modal">
+        <form class="modal-card" id="profile-form"><div class="modal-header"><div><span>ПРОФИЛЬ УЧАСТНИКА</span><h2>Ваше имя</h2></div><button type="button" data-close-modal="profile-modal" aria-label="Закрыть">×</button></div><label for="profile-name-input">Имя, которое увидят в комнате и у курсора</label><input id="profile-name-input" maxlength="40" required autocomplete="name" /><div class="modal-actions"><button type="button" class="button secondary" data-close-modal="profile-modal">Отмена</button><button class="button primary" type="submit">Сохранить</button></div></form>
+      </div>
+
+      <div class="modal-backdrop hidden" id="create-contest-modal">
+        <form class="modal-card" id="create-contest-form"><div class="modal-header"><div><span>НОВЫЙ КОНТЕСТ</span><h2>Создать контест</h2></div><button type="button" data-close-modal="create-contest-modal" aria-label="Закрыть">×</button></div><label for="contest-name-input">Название</label><input id="contest-name-input" maxlength="60" required placeholder="Например, Основы Python" /><p>В новый контест добавится пустое задание с окном для решения.</p><div class="modal-actions"><button type="button" class="button secondary" data-close-modal="create-contest-modal">Отмена</button><button class="button primary" type="submit">Создать</button></div></form>
+      </div>
+
+      <div class="modal-backdrop hidden" id="rename-modal">
+        <form class="modal-card" id="rename-form">
+          <div class="modal-header"><div><span>ВКЛАДКА РЕШЕНИЯ</span><h2>Переименовать</h2></div><button type="button" data-close-modal="rename-modal" aria-label="Закрыть">×</button></div>
+          <label for="rename-input">Название после номера задачи</label>
+          <div class="rename-row"><span id="rename-prefix">0.</span><input id="rename-input" maxlength="40" pattern="[A-Za-zА-Яа-яЁё0-9_-]+" /></div>
+          <p>Номер задачи изменить нельзя. Разрешены буквы, цифры, дефис и подчёркивание.</p>
+          <div class="modal-actions"><button type="button" class="button secondary" data-close-modal="rename-modal">Отмена</button><button class="button primary" type="submit">Сохранить</button></div>
+        </form>
+      </div>
+
+      <div class="modal-backdrop hidden" id="lesson-modal">
+        <div class="modal-card lesson-card">
+          <div class="modal-header"><div><span>ЗАНЯТИЕ</span><h2 id="lesson-modal-title">Сохранить или открыть занятие</h2></div><button data-close-modal="lesson-modal" aria-label="Закрыть">×</button></div>
+          <div class="lesson-options">
+            <button class="lesson-option" data-export-mode="template"><b>Задачи для повторения</b><small>Условия сохранятся, решения будут пустыми.</small><em>Скачать</em></button>
+            <button class="lesson-option" data-export-mode="snapshot"><b>Текущее состояние</b><small>Сохранить условия и весь написанный код.</small><em>Скачать</em></button>
+          </div>
+          <div class="lesson-local" id="lesson-local-actions">
+            <button class="button secondary" id="open-room-file">Открыть .cwmroom</button>
+            <button class="button secondary" id="local-copy-button">Создать локальную копию</button>
+            <input id="room-file-input" type="file" accept=".cwmroom,application/json" hidden />
+            <p>Локальная комната работает без сервера и подключений.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="invite-modal">
+        <div class="modal-card invite-card">
+          <div class="modal-header"><div><span>ПРИГЛАШЕНИЕ</span><h2>Подключиться к комнате</h2></div><button data-close-modal="invite-modal" aria-label="Закрыть">×</button></div>
+          <label for="invite-link">Ссылка для участников</label>
+          <div class="invite-row"><input id="invite-link" readonly /><button class="button primary" id="copy-invite-button">Скопировать</button></div>
+          <p>Ссылка работает для устройств в одной локальной сети.</p>
+        </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="join-modal">
+        <form class="modal-card join-card" id="join-form">
+          <div class="modal-header"><div><span>КОМНАТА</span><h2>Как вас подписать?</h2></div></div>
+          <label for="join-name">Имя участника</label>
+          <input id="join-name" maxlength="40" autocomplete="name" placeholder="Например, Маша" />
+          <p>Это имя увидят остальные участники.</p>
+          <div class="modal-actions"><button class="button primary" type="submit">Войти в комнату</button></div>
+        </form>
+      </div>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

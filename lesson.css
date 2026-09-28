@@ -1,0 +1,19 @@
+.lesson-card { width: 480px; }
+.lesson-options { display: grid; gap: 9px; }
+.lesson-option { width: 100%; display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 11px; text-align: left; padding: 12px; background: #20232b; border: 1px solid #353842; border-radius: 7px; }
+.lesson-option:hover { background: #272b34; border-color: #4a4e59; }
+.lesson-option-icon { width: 34px; height: 34px; border-radius: 7px; background: #29382e; color: #a5efbd; display: grid; place-items: center; font-size: 18px; }
+.lesson-option > span:nth-child(2) { display: flex; flex-direction: column; gap: 4px; }
+.lesson-option strong { font-size: 11px; color: #e5e7eb; }
+.lesson-option small { font-size: 9px; line-height: 1.45; color: #8f939e; }
+.lesson-option-action { font-size: 9px; color: #a5efbd; }
+.lesson-local { margin-top: 18px; padding-top: 15px; border-top: 1px solid #30333c; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.lesson-divider { width: 100%; font-size: 8px; letter-spacing: 1px; color: #777b86; }
+.lesson-local p { width: 100%; margin: 2px 0 0; font-size: 9px; line-height: 1.5; color: #777b86; }
+.room-live.room-local { color: #d4c0fa; background: #282334; border-color: #41375b; }
+.room-live.room-local i { background: #b9a0ee; box-shadow: 0 0 7px #a88ee866; }
+
+@media (max-width: 1120px) {
+  #lesson-button { width: 34px; overflow: hidden; padding: 0; color: transparent; }
+  #lesson-button::before { content: "↓"; color: #d5d7de; font-size: 15px; }
+}

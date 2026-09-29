@@ -44,7 +44,7 @@
       </header>
 
       <main class="home-view hidden" id="home-view">
-        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
+        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-connect-button">Подключиться по ссылке</button><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Мои контесты</h2><span>Созданные на этом компьютере</span></div><div class="contest-list" id="my-contest-list" aria-label="Мои контесты"></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Сохранённые и импортированные</h2><span>Снимки занятий и загруженные контесты</span></div><div class="contest-list" id="saved-contest-list" aria-label="Сохранённые контесты"></div></section>
         <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Компиляторы и интерпретаторы, необходимые для запуска решений на этом компьютере</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные языки…</p></div></section>
@@ -174,8 +174,18 @@
           <div class="modal-header"><div><span>ПРИГЛАШЕНИЕ</span><h2>Подключиться к комнате</h2></div><button data-close-modal="invite-modal" aria-label="Закрыть">×</button></div>
           <label for="invite-link">Ссылка для участников</label>
           <div class="invite-row"><input id="invite-link" readonly /><button class="button primary" id="copy-invite-button">Скопировать</button></div>
-          <p>Ссылка работает для устройств в одной локальной сети.</p>
+          <p>Ссылку можно открыть из любой сети в браузере или вставить в главном меню приложения. Она действует, пока комната запущена.</p>
         </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="connect-room-modal">
+        <form class="modal-card connect-card" id="connect-room-form">
+          <div class="modal-header"><div><span>СОВМЕСТНАЯ КОМНАТА</span><h2>Подключиться по ссылке</h2></div><button type="button" data-close-modal="connect-room-modal" aria-label="Закрыть">×</button></div>
+          <label for="connect-room-url">Ссылка-приглашение</label>
+          <input id="connect-room-url" type="url" required autocomplete="url" placeholder="https://…/?code=…" />
+          <p>Вставьте ссылку от ведущего. Комната откроется прямо в приложении.</p>
+          <div class="modal-actions"><button class="button secondary" type="button" data-close-modal="connect-room-modal">Отмена</button><button class="button primary" type="submit">Продолжить</button></div>
+        </form>
       </div>
 
       <div class="modal-backdrop hidden" id="join-modal">

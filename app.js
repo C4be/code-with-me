@@ -1,4 +1,11 @@
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+let isPermissionGranted = async () => false;
+let requestPermission = async () => "denied";
+let sendNotification = () => {};
+const notificationsReady = window.__TAURI__
+  ? import("@tauri-apps/plugin-notification").then((plugin) => {
+    ({ isPermissionGranted, requestPermission, sendNotification } = plugin);
+  }).catch(() => {})
+  : Promise.resolve();
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -168,6 +175,7 @@ async function notifyDisconnected() {
   showToast(message, 6500);
   if (!window.__TAURI__?.core?.invoke) return;
   try {
+    await notificationsReady;
     let granted = await isPermissionGranted();
     if (!granted) granted = (await requestPermission()) === "granted";
     if (granted) sendNotification({ title: "Code with me", body: message });
@@ -1021,6 +1029,7 @@ async function connectRoom(info, host = false, guestName = "") {
         renderRoomParticipants(message.room.participants || []);
         try {
           await loadWorkspace();
+          if (!host) showWorkspace();
           ready = true;
           sendPresence();
           resolve();
@@ -1068,6 +1077,11 @@ async function startRoom() {
     showToast("Комната запускается из desktop-приложения");
     return;
   }
+  const button = $("#start-room-button");
+  const buttonLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Подключаем…";
+  showToast("Подготавливаем публичную ссылку…", 90000);
   try {
     await persistWorkspace();
     const info = await invoke("start_room");
@@ -1075,6 +1089,9 @@ async function startRoom() {
     showToast("Комната запущена");
   } catch (error) {
     showToast(`Не удалось создать комнату: ${error}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = buttonLabel;
   }
 }
 
@@ -1103,25 +1120,45 @@ async function stopRoom() {
   }
 }
 
+async function prepareInvite(urlText) {
+  const invite = new URL(urlText);
+  if (!new Set(["https:", "http:"]).has(invite.protocol) || invite.username || invite.password) {
+    throw new Error("Нужна HTTP или HTTPS ссылка-приглашение");
+  }
+  const code = invite.searchParams.get("code");
+  if (!code || code.length > 128) throw new Error("В ссылке не найден код комнаты");
+  roomState.base = invite.origin;
+  roomState.code = code;
+  const info = await roomFetch("/api/room");
+  if (!info?.inviteCode || info.inviteCode !== code) throw new Error("Ссылка недействительна");
+  if (info.participantCount >= info.maxParticipants) throw new Error("В комнате уже 10 участников");
+  pendingRoomInfo = info;
+  $("#join-name").value = localStorage.getItem("code-with-me-name") || "";
+  $("#connect-room-modal").classList.add("hidden");
+  $("#join-modal").classList.remove("hidden");
+  setTimeout(() => $("#join-name").focus(), 20);
+}
+
+async function connectFromInvite(event) {
+  event.preventDefault();
+  try {
+    await prepareInvite($("#connect-room-url").value.trim());
+  } catch (error) {
+    pendingRoomInfo = null;
+    resetRoomConnection();
+    showToast(`Не удалось открыть приглашение: ${error.message || error}`);
+  }
+}
+
 async function joinFromLink() {
   const code = new URLSearchParams(location.search).get("code");
   if (!code) return false;
-  roomState.base = location.origin;
-  roomState.code = code;
   try {
-    pendingRoomInfo = await roomFetch("/api/room");
-    if (pendingRoomInfo.participantCount >= pendingRoomInfo.maxParticipants) {
-      pendingRoomInfo = null;
-      resetRoomConnection();
-      setRoomChrome("Комната заполнена", false);
-      showToast("В комнате уже 10 участников");
-      return true;
-    }
-    $("#join-name").value = localStorage.getItem("code-with-me-name") || "";
-    $("#join-modal").classList.remove("hidden");
-    setTimeout(() => $("#join-name").focus(), 20);
+    await prepareInvite(location.href);
   } catch (error) {
-    showToast(`Не удалось подключиться: ${error.message}`);
+    resetRoomConnection();
+    setRoomChrome("Не удалось подключиться", false);
+    showToast(`Не удалось подключиться: ${error.message || error}`);
   }
   return true;
 }
@@ -1534,6 +1571,12 @@ function init() {
   $("#close-contest-button").addEventListener("click", showHome);
   $(".brand").addEventListener("click", (event) => { event.preventDefault(); showHome(); });
   $("#home-import-button").addEventListener("click", () => $("#home-file-input").click());
+  $("#home-connect-button").addEventListener("click", () => {
+    $("#connect-room-url").value = "";
+    $("#connect-room-modal").classList.remove("hidden");
+    setTimeout(() => $("#connect-room-url").focus(), 20);
+  });
+  $("#connect-room-form").addEventListener("submit", connectFromInvite);
   $("#home-file-input").addEventListener("change", importRoomFile);
   $("#home-view").addEventListener("click", (event) => {
     const exportButton = event.target.closest("[data-export-folder]");

@@ -14,9 +14,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, UdpSocket},
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
@@ -24,8 +25,9 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State as TauriState};
 use tokio::{
-    process::Command,
-    sync::{broadcast, oneshot, RwLock},
+    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    process::{Child, Command},
+    sync::{broadcast, mpsc, oneshot, RwLock},
     time::timeout,
 };
 use tower_http::cors::CorsLayer;
@@ -38,6 +40,9 @@ const ROOM_ARCHIVE_VERSION: u8 = 1;
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_ARCHIVE_JSON_BYTES: usize = 140 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 5000;
+const MAX_CLOUDFLARED_DOWNLOAD_BYTES: usize = 80 * 1024 * 1024;
+const CLOUDFLARED_RELEASE_API: &str =
+    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +89,7 @@ struct RoomData {
 struct RunningRoom {
     data: Arc<RoomData>,
     stop: oneshot::Sender<()>,
+    tunnel: Child,
 }
 
 #[derive(Default)]
@@ -162,6 +168,19 @@ struct ArchiveFile {
     kind: String,
     encoding: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct CloudflaredRelease {
+    tag_name: String,
+    assets: Vec<CloudflaredAsset>,
+}
+
+#[derive(Deserialize)]
+struct CloudflaredAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
 }
 
 pub fn run() {
@@ -1049,7 +1068,10 @@ fn create_contest(
 }
 
 #[tauri::command]
-async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, String> {
+async fn start_room(
+    app: AppHandle,
+    manager: TauriState<'_, RoomManager>,
+) -> Result<RoomInfo, String> {
     let already_running = {
         manager
             .running
@@ -1067,14 +1089,19 @@ async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, St
         .map_err(|_| "Папка проекта недоступна")?
         .clone()
         .ok_or_else(|| "Папка проекта ещё не настроена".to_string())?;
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let cloudflared = ensure_cloudflared(&app).await?;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("Не удалось запустить комнату: {error}"))?;
     let port = listener
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let address = local_address();
+    let (public_base, tunnel) = start_public_tunnel(&cloudflared, port).await?;
+    let address = public_base
+        .strip_prefix("https://")
+        .unwrap_or(&public_base)
+        .to_string();
     let invite_code = Uuid::new_v4().simple().to_string();
     let room_id = Uuid::new_v4().to_string();
     let host_id = Uuid::new_v4().to_string();
@@ -1087,13 +1114,13 @@ async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, St
             host: true,
         },
     );
-    let url = format!("http://{address}:{port}/?code={invite_code}");
+    let url = format!("{public_base}/?code={invite_code}");
     let info = RoomInfo {
         room_id,
         invite_code: invite_code.clone(),
         invite_url: url,
         address,
-        port,
+        port: 443,
         participant_count: 1,
         max_participants: MAX_PARTICIPANTS,
         participants: vec![ParticipantView {
@@ -1120,6 +1147,7 @@ async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, St
     let room = RunningRoom {
         data: data.clone(),
         stop,
+        tunnel,
     };
     *manager
         .running
@@ -1130,12 +1158,16 @@ async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, St
 
 #[tauri::command]
 async fn stop_room(manager: TauriState<'_, RoomManager>) -> Result<(), String> {
-    let mut running = manager
-        .running
-        .lock()
-        .map_err(|_| "Состояние комнаты недоступно")?;
-    if let Some(room) = running.take() {
+    let room = {
+        let mut running = manager
+            .running
+            .lock()
+            .map_err(|_| "Состояние комнаты недоступно")?;
+        running.take()
+    };
+    if let Some(mut room) = room {
         let _ = room.stop.send(());
+        let _ = room.tunnel.kill().await;
     }
     Ok(())
 }
@@ -1171,79 +1203,302 @@ async fn room_info(room: &RoomData) -> RoomInfo {
     info
 }
 
-fn local_address() -> String {
-    let mut addresses = platform_ipv4_addresses();
-    addresses.sort_by_key(|address| !address.is_private());
-    if let Some(address) = addresses.into_iter().find(is_usable_lan_address) {
-        return address.to_string();
-    }
-
-    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .ok()
-        .and_then(|socket| {
-            socket.connect("8.8.8.8:80").ok()?;
-            socket.local_addr().ok()
-        })
-        .and_then(|addr| match addr.ip() {
-            std::net::IpAddr::V4(address) if is_usable_lan_address(&address) => {
-                Some(address.to_string())
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| "127.0.0.1".into())
-}
-
-fn is_usable_lan_address(address: &Ipv4Addr) -> bool {
-    let octets = address.octets();
-    !address.is_loopback()
-        && !address.is_link_local()
-        && !address.is_multicast()
-        && !address.is_unspecified()
-        && octets != [255, 255, 255, 255]
-        && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
-}
-
-#[cfg(target_os = "macos")]
-fn platform_ipv4_addresses() -> Vec<Ipv4Addr> {
-    command_ipv4_addresses("/sbin/ifconfig", &[], true)
-}
-
-#[cfg(target_os = "linux")]
-fn platform_ipv4_addresses() -> Vec<Ipv4Addr> {
-    command_ipv4_addresses("hostname", &["-I"], false)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_ipv4_addresses() -> Vec<Ipv4Addr> {
-    command_ipv4_addresses("ipconfig", &[], false)
-}
-
-fn command_ipv4_addresses(program: &str, args: &[&str], inet_lines_only: bool) -> Vec<Ipv4Addr> {
-    let Ok(output) = StdCommand::new(program).args(args).output() else {
-        return Vec::new();
+async fn ensure_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
+    let (asset_name, archive) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "x86_64") => ("cloudflared-darwin-amd64.tgz", true),
+        ("macos", "aarch64") => ("cloudflared-darwin-arm64.tgz", true),
+        ("linux", "x86_64") => ("cloudflared-linux-amd64", false),
+        ("linux", "aarch64") => ("cloudflared-linux-arm64", false),
+        ("windows", "x86_64") => ("cloudflared-windows-amd64.exe", false),
+        (os, arch) => {
+            return Err(format!(
+                "Публичные комнаты пока не поддерживаются на этой архитектуре ({os}/{arch})"
+            ));
+        }
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    if inet_lines_only {
-        return text
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                (fields.next() == Some("inet"))
-                    .then(|| fields.next())
-                    .flatten()
-                    .and_then(|value| value.parse().ok())
-            })
-            .collect();
-    }
+    let binary_name = if std::env::consts::OS == "windows" {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    };
+    let tool_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Не удалось найти папку данных приложения: {error}"))?
+        .join("tools")
+        .join(format!(
+            "cloudflared-{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    std::fs::create_dir_all(&tool_dir)
+        .map_err(|error| format!("Не удалось подготовить публичный доступ: {error}"))?;
+    let installed_binary = tool_dir.join(binary_name);
+    let cached_binary = std::fs::metadata(&installed_binary)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 1_000_000);
+    let cached_version = std::fs::read_to_string(tool_dir.join("version")).unwrap_or_default();
 
-    text.split_whitespace()
-        .filter_map(|value| {
-            value
-                .trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
-                .parse()
-                .ok()
-        })
-        .collect()
+    let client = reqwest::Client::builder()
+        .user_agent("Code-with-me-desktop")
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| format!("Не удалось подготовить загрузчик туннеля: {error}"))?;
+    let release_response = client
+        .get(CLOUDFLARED_RELEASE_API)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| error.to_string());
+    let release_response = match release_response {
+        Ok(response) => response,
+        Err(_) if cached_binary => return Ok(installed_binary),
+        Err(error) => {
+            return Err(format!(
+                "Для публичной комнаты нужно загрузить сетевой компонент. Проверьте подключение к интернету и повторите попытку: {error}"
+            ));
+        }
+    };
+    let release: CloudflaredRelease = match release_response.json().await {
+        Ok(release) => release,
+        Err(_) if cached_binary => return Ok(installed_binary),
+        Err(error) => {
+            return Err(format!(
+                "Не удалось прочитать выпуск сетевого компонента: {error}"
+            ));
+        }
+    };
+    let release_tag = release.tag_name;
+    if release_tag.is_empty()
+        || !release_tag
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    {
+        return Err("Получено некорректное имя выпуска сетевого компонента".into());
+    }
+    if cached_binary && cached_version.trim() == release_tag {
+        return Ok(installed_binary);
+    }
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| format!("В выпуске cloudflared нет файла {asset_name}"))?;
+    if !asset
+        .browser_download_url
+        .starts_with("https://github.com/cloudflare/cloudflared/releases/download/")
+    {
+        return Err("Источник сетевого компонента не прошёл проверку".into());
+    }
+    let expected_digest = asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "Выпуск cloudflared не содержит контрольную сумму SHA-256".to_string())?;
+    let response = client
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| format!("Не удалось загрузить сетевой компонент: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_CLOUDFLARED_DOWNLOAD_BYTES as u64)
+    {
+        return Err("Файл сетевого компонента превышает допустимый размер".into());
+    }
+    let package = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Не удалось получить сетевой компонент: {error}"))?;
+    if package.len() > MAX_CLOUDFLARED_DOWNLOAD_BYTES {
+        return Err("Файл сетевого компонента превышает допустимый размер".into());
+    }
+    let actual_digest = format!("{:x}", Sha256::digest(&package));
+    if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+        return Err("Контрольная сумма сетевого компонента не совпала".into());
+    }
+    let binary = if archive {
+        extract_cloudflared_binary(&package)?
+    } else {
+        package.to_vec()
+    };
+    if binary.len() < 1_000_000 {
+        return Err("Загруженный сетевой компонент выглядит повреждённым".into());
+    }
+    let pending = tool_dir.join(format!("{binary_name}.download"));
+    std::fs::write(&pending, binary)
+        .map_err(|error| format!("Не удалось сохранить сетевой компонент: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("Не удалось разрешить запуск сетевого компонента: {error}"))?;
+    }
+    if installed_binary.exists() {
+        std::fs::remove_file(&installed_binary)
+            .map_err(|error| format!("Не удалось обновить сетевой компонент: {error}"))?;
+    }
+    std::fs::rename(&pending, &installed_binary)
+        .map_err(|error| format!("Не удалось установить сетевой компонент: {error}"))?;
+    std::fs::write(tool_dir.join("version"), release_tag)
+        .map_err(|error| format!("Не удалось сохранить версию сетевого компонента: {error}"))?;
+    Ok(installed_binary)
+}
+
+fn extract_cloudflared_binary(package: &[u8]) -> Result<Vec<u8>, String> {
+    let decoder = flate2::read::GzDecoder::new(package);
+    let mut expanded = Vec::new();
+    decoder
+        .take(MAX_CLOUDFLARED_DOWNLOAD_BYTES as u64)
+        .read_to_end(&mut expanded)
+        .map_err(|error| format!("Не удалось распаковать сетевой компонент: {error}"))?;
+    if expanded.len() >= MAX_CLOUDFLARED_DOWNLOAD_BYTES {
+        return Err("Распакованный сетевой компонент превышает допустимый размер".into());
+    }
+    let mut offset = 0;
+    while offset + 512 <= expanded.len() {
+        let header = &expanded[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let name = std::str::from_utf8(&header[..100])
+            .unwrap_or("")
+            .trim_matches('\0');
+        let prefix = std::str::from_utf8(&header[345..500])
+            .unwrap_or("")
+            .trim_matches('\0');
+        let relative = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let size_field = std::str::from_utf8(&header[124..136])
+            .unwrap_or("")
+            .trim_matches('\0')
+            .trim();
+        let size = usize::from_str_radix(size_field, 8)
+            .map_err(|_| "Архив сетевого компонента повреждён".to_string())?;
+        let payload_start = offset + 512;
+        let payload_end = payload_start.saturating_add(size);
+        if payload_end > expanded.len() {
+            return Err("Архив сетевого компонента обрезан".into());
+        }
+        if Path::new(&relative)
+            .file_name()
+            .and_then(|value| value.to_str())
+            == Some("cloudflared")
+            && matches!(header[156], 0 | b'0')
+        {
+            return Ok(expanded[payload_start..payload_end].to_vec());
+        }
+        offset = payload_start + size.div_ceil(512) * 512;
+    }
+    Err("В архиве не найден исполняемый файл cloudflared".into())
+}
+
+async fn forward_tunnel_output<R>(stream: R, sender: mpsc::UnboundedSender<String>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let shortened: String = line.chars().take(2000).collect();
+        if sender.send(shortened).is_err() {
+            break;
+        }
+    }
+}
+
+fn tunnel_url_from_log(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let candidate = line[start..]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['.', ',', ')', ']', '}', '"', '\'']);
+    let host = candidate.strip_prefix("https://")?.split('/').next()?;
+    (host.ends_with(".trycloudflare.com") && host.len() > ".trycloudflare.com".len())
+        .then(|| format!("https://{host}"))
+}
+
+async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Child), String> {
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut command = Command::new(executable);
+    command
+        .arg("tunnel")
+        .arg("--no-autoupdate")
+        .arg("--url")
+        .arg(origin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Не удалось запустить публичный туннель: {error}"))?;
+    let (sender, mut output) = mpsc::unbounded_channel();
+    if let Some(stdout) = child.stdout.take() {
+        tauri::async_runtime::spawn(forward_tunnel_output(stdout, sender.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tauri::async_runtime::spawn(forward_tunnel_output(stderr, sender.clone()));
+    }
+    drop(sender);
+
+    let mut log_lines = Vec::new();
+    let tunnel = timeout(Duration::from_secs(90), async {
+        loop {
+            tokio::select! {
+                line = output.recv() => match line {
+                    Some(line) => {
+                        if let Some(url) = tunnel_url_from_log(&line) {
+                            return Ok(url);
+                        }
+                        if log_lines.len() < 8 {
+                            log_lines.push(line);
+                        }
+                    }
+                    None => return Err("Публичный туннель закрыл журнал запуска".to_string()),
+                },
+                status = child.wait() => {
+                    let detail = status
+                        .map(|status| format!("Код завершения: {status}"))
+                        .unwrap_or_else(|error| error.to_string());
+                    return Err(format!("Публичный туннель завершился до создания ссылки. {detail}"));
+                }
+            }
+        }
+    })
+    .await;
+    let public_base = match tunnel {
+        Ok(Ok(url)) => url,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let details = log_lines.join(" ");
+            return Err(if details.is_empty() {
+                error
+            } else {
+                format!("{error}. {details}")
+            });
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err("Публичная ссылка не появилась за 90 секунд. Проверьте интернет и повторите попытку".into());
+        }
+    };
+    if child
+        .try_wait()
+        .map_err(|error| format!("Не удалось проверить состояние туннеля: {error}"))?
+        .is_some()
+    {
+        return Err("Публичный туннель завершился сразу после запуска".into());
+    }
+    Ok((public_base, child))
 }
 
 fn room_router(room: Arc<RoomData>) -> Router {

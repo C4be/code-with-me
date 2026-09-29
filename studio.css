@@ -134,31 +134,31 @@ button { border: 0; cursor: pointer; }
 
 .task-form { min-height: 100%; display: grid; grid-template-columns: 1fr 1fr; align-content: start; gap: 14px; padding: 20px; }
 .task-form label, .modal-card label { display: flex; flex-direction: column; gap: 7px; color: var(--soft); font-size: 9px; font-weight: 650; }
-.task-form label.wide { grid-column: 1 / -1; }
+.task-form>.wide { grid-column: 1 / -1; min-width: 0; }
 .task-form input, .task-form textarea, .task-form select, .modal-card input { width: 100%; border: 1px solid var(--line-strong); border-radius: 8px; outline: 0; background: var(--surface-soft); color: var(--text); }
 .task-form input, .task-form select, .modal-card input { height: 38px; padding: 0 10px; }
 .task-form textarea { min-height: 280px; padding: 11px; resize: vertical; font: 11px/1.65 var(--mono); }
 .task-form input:focus, .task-form textarea:focus, .task-form select:focus, .modal-card input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
-.body-field { min-height: 340px; }
-.body-field textarea { flex: 1; }
 .body-field { min-height: 170px; }
-.body-field textarea { min-height: 150px; font-family: inherit; }
-.examples-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.body-field textarea { flex: 1; min-height: 150px; font-family: inherit; }
+.examples-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 .examples-heading>div { display: grid; gap: 4px; }
 .examples-heading strong { font-size: 11px; }
 .examples-heading small { color: var(--muted); font-size: 9px; }
 .examples-heading button:disabled { opacity: .45; cursor: default; }
-.task-examples-form { display: grid; gap: 10px; }
+.task-examples-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .example-form-row, .preview-example { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
 .example-form-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 10px; }
 .example-remove { width: 24px; height: 24px; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; }
 .example-remove:hover { background: var(--surface-hover); color: var(--text); }
-.example-form-fields, .preview-example>div { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.example-form-fields, .preview-example>div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .example-form-fields textarea { min-height: 86px; font: 11px/1.5 var(--mono); }
 .preview-example { margin: 10px 0; }
 .preview-example>strong { display: block; margin-bottom: 10px; color: var(--text); }
 .preview-example section { min-width: 0; }
-.preview-example span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 9px; }
+.preview-example .preview-example-label { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 5px; color: var(--muted); font-size: 9px; }
+.preview-example .copy-example-button { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--soft); font-size: 14px; }
+.preview-example .copy-example-button:hover { border-color: var(--accent); color: var(--accent); }
 .preview-example pre { min-height: 40px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .source-view { display: flex; flex-direction: column; }
 .source-note { flex: none; padding: 10px 16px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 9px; }

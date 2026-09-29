@@ -520,7 +520,37 @@ function renderTaskPreview(challenge) {
   $("#task-difficulty").textContent = ({ easy: "ЛЁГКАЯ", medium: "СРЕДНЯЯ", hard: "СЛОЖНАЯ" })[challenge.difficulty] || "ЗАДАНИЕ";
   $("#task-meta").textContent = `⏱ ${challenge.time_limit || "—"} минут`;
   const examples = (challenge.examples || []).slice(0, MAX_EXAMPLES);
-  $("#task-description").innerHTML = `${markdownToHTML(challenge.body)}${examples.length ? `<h3>Примеры</h3>${examples.map((example, index) => `<div class="preview-example"><strong>Пример ${index + 1}</strong><div><section><span>Ввод</span><pre>${escapeHTML(example.input)}</pre></section><section><span>Вывод</span><pre>${escapeHTML(example.output)}</pre></section></div></div>`).join("")}` : ""}`;
+  const copyButton = (index, field, label) => `<button class="copy-example-button" type="button" data-copy-example-index="${index}" data-copy-example-field="${field}" title="Копировать ${label.toLowerCase()}" aria-label="Копировать ${label.toLowerCase()} примера ${index + 1}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button>`;
+  $("#task-description").innerHTML = `${markdownToHTML(challenge.body)}${examples.length ? `<h3>Примеры</h3>${examples.map((example, index) => `<div class="preview-example"><strong>Пример ${index + 1}</strong><div><section><div class="preview-example-label"><span>Ввод</span>${copyButton(index, "input", "Ввод")}</div><pre>${escapeHTML(example.input)}</pre></section><section><div class="preview-example-label"><span>Вывод</span>${copyButton(index, "output", "Вывод")}</div><pre>${escapeHTML(example.output)}</pre></section></div></div>`).join("")}` : ""}`;
+}
+
+async function writeClipboardText(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* В файловом предпросмотре API может быть недоступен. */ }
+  }
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Буфер обмена недоступен");
+}
+
+async function copyExample(button) {
+  const index = Number(button.dataset.copyExampleIndex);
+  const field = button.dataset.copyExampleField;
+  if (!Number.isInteger(index) || !["input", "output"].includes(field)) return;
+  const example = parseChallenge(files[currentTaskFile] || initialTask).examples?.[index];
+  if (!example) return;
+  try {
+    await writeClipboardText(example[field] || "");
+    showToast(`${field === "input" ? "Ввод" : "Вывод"} примера ${index + 1} скопирован`);
+  } catch (error) {
+    showToast(`Не удалось скопировать: ${error.message || error}`);
+  }
 }
 
 function renderExampleForm(examples = []) {
@@ -1657,6 +1687,10 @@ function init() {
     handleTaskFormInput();
   });
   $("#task-source-input").addEventListener("input", handleTaskSourceInput);
+  $("#task-preview-view").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-copy-example-index]");
+    if (button) copyExample(button);
+  });
   $("#task-rail").addEventListener("click", (event) => {
     const task = event.target.closest("[data-task-file]");
     if (task) selectTask(task.dataset.taskFile);

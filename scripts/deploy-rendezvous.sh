@@ -37,21 +37,23 @@ set -euo pipefail
 domain="$1"
 public_ip="$2"
 legacy_domain="$3"
+remote_user="$(id -un)"
+remote_group="$(id -gn)"
 sudo install -d -m 755 /opt/code-with-me
 sudo install -m 755 "$HOME/code-with-me-deploy/rendezvous" /opt/code-with-me/rendezvous
 sudo install -d -m 755 /opt/code-with-me/dist
 sudo tar -C /opt/code-with-me --no-same-owner -xzf "$HOME/code-with-me-deploy/dist.tgz"
-sudo install -d -m 750 -o root -g c4be /etc/code-with-me
+sudo install -d -m 750 -o root -g "$remote_group" /etc/code-with-me
 if ! sudo test -f /etc/code-with-me/turn.secret; then
   openssl rand -hex 32 | sudo tee /etc/code-with-me/turn.secret >/dev/null
-  sudo chown root:c4be /etc/code-with-me/turn.secret
+  sudo chown "root:$remote_group" /etc/code-with-me/turn.secret
   sudo chmod 640 /etc/code-with-me/turn.secret
 fi
 turn_secret="$(sudo cat /etc/code-with-me/turn.secret)"
 private_ip="$(hostname -I | awk '{print $1}')"
 
 printf 'PUBLIC_URL=https://%s\nLEGACY_PUBLIC_URL=https://%s\nTURN_HOST=%s\nTURN_LEGACY_HOST=%s\nTURN_SECRET=%s\n' "$domain" "$legacy_domain" "$domain" "$legacy_domain" "$turn_secret" | sudo tee /etc/code-with-me/rendezvous.env >/dev/null
-sudo chown root:c4be /etc/code-with-me/rendezvous.env
+sudo chown "root:$remote_group" /etc/code-with-me/rendezvous.env
 sudo chmod 640 /etc/code-with-me/rendezvous.env
 
 cat <<SERVICE | sudo tee /etc/systemd/system/code-with-me-rendezvous.service >/dev/null
@@ -61,8 +63,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=c4be
-Group=c4be
+User=$remote_user
+Group=$remote_group
 EnvironmentFile=/etc/code-with-me/rendezvous.env
 ExecStart=/opt/code-with-me/rendezvous
 Restart=always

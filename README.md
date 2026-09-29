@@ -80,7 +80,7 @@ pnpm dev
 bash scripts/deploy-rendezvous.sh
 ```
 
-Для другого домена: `bash scripts/deploy-rendezvous.sh example.com user@IP IP`. В группе безопасности VPS нужно разрешить входящие TCP 80/443, TCP и UDP 3478, UDP 49160–49200. Правило SSH 22 сохраняется. DNS-записи `@` и `www` должны указывать на публичный IP VPS; [обновление DNS может занять до 24 часов](https://help.reg.ru/support/dns-servery-i-nastroyka-zony/nastroyka-resursnykh-zapisey-dns/chto-takoye-resursnyye-zapisi-dns). Старые сборки с временным адресом `176-123-162-101.sslip.io` продолжат работать после перехода. Для другого домена пересоберите настольное приложение с переменной `CODE_WITH_ME_RENDEZVOUS_BASE=https://example.com`.
+Для другого домена: `bash scripts/deploy-rendezvous.sh example.com user@IP IP`. В группе безопасности VPS нужно разрешить входящие TCP 80/443, TCP и UDP 3478, UDP 49160–49200. Правило SSH 22 сохраняется. DNS-записи `@` и `www` должны указывать на публичный IP VPS; [обновление DNS может занять до 24 часов](https://help.reg.ru/support/dns-servery-i-nastroyka-zony/nastroyka-resursnykh-zapisey-dns/chto-takoye-resursnyye-zapisi-dns). Пока основной домен не доступен, настольное приложение использует прежний временный адрес для новых комнат; старые сборки тоже продолжат работать. Для другого домена пересоберите настольное приложение с переменной `CODE_WITH_ME_RENDEZVOUS_BASE=https://example.com`.
 
 ## Запуск кода и безопасность
 

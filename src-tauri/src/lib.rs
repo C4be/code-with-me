@@ -35,6 +35,7 @@ const RENDEZVOUS_BASE: &str = match option_env!("CODE_WITH_ME_RENDEZVOUS_BASE") 
     Some(value) => value,
     None => "https://code-with-me-app.ru",
 };
+const LEGACY_RENDEZVOUS_BASE: &str = "https://176-123-162-101.sslip.io";
 const RUN_TIMEOUT: Duration = Duration::from_secs(15);
 const ROOM_ARCHIVE_FORMAT: &str = "code-with-me-room";
 const ROOM_ARCHIVE_VERSION: u8 = 1;
@@ -83,6 +84,7 @@ struct Participant {
 struct RoomData {
     info: RoomInfo,
     host_secret: String,
+    rendezvous_base: String,
     root: PathBuf,
     participants: RwLock<HashMap<String, Participant>>,
     events: broadcast::Sender<Value>,
@@ -1084,10 +1086,6 @@ async fn start_room(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let address = RENDEZVOUS_BASE
-        .strip_prefix("https://")
-        .unwrap_or(RENDEZVOUS_BASE)
-        .to_string();
     let invite_code = Uuid::new_v4().simple().to_string();
     let room_id = Uuid::new_v4().to_string();
     let host_secret = Uuid::new_v4().simple().to_string();
@@ -1101,16 +1099,36 @@ async fn start_room(
             host: true,
         },
     );
-    let url = format!("{RENDEZVOUS_BASE}/?room={room_id}&code={invite_code}");
-    reqwest::Client::new()
-        .post(format!("{RENDEZVOUS_BASE}/api/rooms"))
-        .timeout(Duration::from_secs(15))
-        .json(&json!({"roomId":room_id,"inviteCode":invite_code,"hostSecret":host_secret,"inviteURL":url}))
-        .send()
-        .await
-        .map_err(|error| format!("Сервер комнат недоступен: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Не удалось зарегистрировать комнату: {error}"))?;
+    let client = reqwest::Client::new();
+    let mut registered = None;
+    let mut last_error = String::new();
+    let bases = if RENDEZVOUS_BASE == "https://code-with-me-app.ru" {
+        vec![RENDEZVOUS_BASE, LEGACY_RENDEZVOUS_BASE]
+    } else {
+        vec![RENDEZVOUS_BASE]
+    };
+    for base in bases {
+        let url = format!("{base}/?room={room_id}&code={invite_code}");
+        let response = client
+            .post(format!("{base}/api/rooms"))
+            .timeout(Duration::from_secs(6))
+            .json(&json!({"roomId":room_id,"inviteCode":invite_code,"hostSecret":host_secret,"inviteURL":url}))
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                registered = Some((base.to_string(), url));
+                break;
+            }
+            Ok(response) => last_error = format!("Сервер комнат вернул {}", response.status()),
+            Err(error) => last_error = format!("Сервер комнат недоступен: {error}"),
+        }
+    }
+    let (rendezvous_base, url) = registered.ok_or(last_error)?;
+    let address = rendezvous_base
+        .strip_prefix("https://")
+        .unwrap_or(&rendezvous_base)
+        .to_string();
     let info = RoomInfo {
         room_id,
         invite_code: invite_code.clone(),
@@ -1130,6 +1148,7 @@ async fn start_room(
     let data = Arc::new(RoomData {
         info,
         host_secret,
+        rendezvous_base,
         root,
         participants: RwLock::new(participants),
         events,
@@ -1166,7 +1185,7 @@ async fn stop_room(manager: TauriState<'_, RoomManager>) -> Result<(), String> {
     if let Some(room) = room {
         let _ = room.stop.send(());
         let _ = reqwest::Client::new()
-            .delete(format!("{RENDEZVOUS_BASE}/api/rooms/{}", room.data.info.room_id))
+            .delete(format!("{}/api/rooms/{}", room.data.rendezvous_base, room.data.info.room_id))
             .header("X-Host-Secret", &room.data.host_secret)
             .timeout(Duration::from_secs(5))
             .send()

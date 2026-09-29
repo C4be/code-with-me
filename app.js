@@ -1002,7 +1002,7 @@ function setRoomChrome(label, online, local = false) {
 
 async function connectRoom(info, host = false, guestName = "") {
   roomState.local = false;
-  roomState.base = new URL(info.inviteUrl).origin;
+  roomState.base = host && info.localBase ? info.localBase : new URL(info.inviteUrl).origin;
   roomState.code = info.inviteCode;
   roomState.inviteUrl = info.inviteUrl;
   roomState.host = host;

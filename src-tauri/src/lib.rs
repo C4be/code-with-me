@@ -50,6 +50,7 @@ struct RoomInfo {
     room_id: String,
     invite_code: String,
     invite_url: String,
+    local_base: Option<String>,
     address: String,
     port: u16,
     participant_count: usize,
@@ -1119,6 +1120,7 @@ async fn start_room(
         room_id,
         invite_code: invite_code.clone(),
         invite_url: url,
+        local_base: Some(format!("http://127.0.0.1:{port}")),
         address,
         port: 443,
         participant_count: 1,
@@ -1405,10 +1407,53 @@ where
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let shortened: String = line.chars().take(2000).collect();
-        if sender.send(shortened).is_err() {
-            break;
-        }
+        // Keep draining cloudflared's pipes after the invite URL has been
+        // captured. Closing them can make the tunnel process exit or block.
+        let _ = sender.send(shortened);
     }
+}
+
+fn append_tunnel_log(log_lines: &mut Vec<String>, line: String) {
+    const MAX_TUNNEL_LOG_LINES: usize = 32;
+    if log_lines.len() == MAX_TUNNEL_LOG_LINES {
+        log_lines.remove(0);
+    }
+    log_lines.push(line);
+}
+
+fn tunnel_precheck_hint(log_lines: &[String]) -> Option<&'static str> {
+    let failed_checks: Vec<_> = log_lines
+        .iter()
+        .filter(|line| line.contains("precheck component=") && line.contains("status=fail"))
+        .collect();
+
+    if failed_checks
+        .iter()
+        .any(|line| line.contains("DNS Resolution"))
+    {
+        return Some(
+            "Не удалось разрешить адреса Cloudflare. Проверьте настройки DNS и подключение VPN или прокси.",
+        );
+    }
+
+    let udp_failed = failed_checks
+        .iter()
+        .any(|line| line.contains("UDP Connectivity"));
+    let tcp_failed = failed_checks
+        .iter()
+        .any(|line| line.contains("TCP Connectivity"));
+    if udp_failed && tcp_failed {
+        return Some(
+            "Сеть не пропускает соединение к Cloudflare через UDP или TCP на порту 7844. Проверьте настройки сети или брандмауэра.",
+        );
+    }
+
+    log_lines
+        .iter()
+        .any(|line| line.contains("precheck complete hard_fail=true"))
+        .then_some(
+            "Проверка соединения с Cloudflare не пройдена. Проверьте DNS, VPN или прокси и доступ к Интернету.",
+        )
 }
 
 fn tunnel_url_from_log(line: &str) -> Option<String> {
@@ -1428,6 +1473,8 @@ async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Ch
     command
         .arg("tunnel")
         .arg("--no-autoupdate")
+        .arg("--protocol")
+        .arg("http2")
         .arg("--url")
         .arg(origin)
         .stdout(Stdio::piped())
@@ -1451,17 +1498,31 @@ async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Ch
     drop(sender);
 
     let mut log_lines = Vec::new();
+    let mut precheck_lines = Vec::new();
+    let mut public_url = None;
+    let mut connection_registered = false;
     let tunnel = timeout(Duration::from_secs(90), async {
         loop {
             tokio::select! {
                 line = output.recv() => match line {
                     Some(line) => {
                         if let Some(url) = tunnel_url_from_log(&line) {
-                            return Ok(url);
+                            public_url = Some(url);
                         }
-                        if log_lines.len() < 8 {
-                            log_lines.push(line);
+                        if line.contains("Registered tunnel connection") {
+                            connection_registered = true;
                         }
+                        if connection_registered {
+                            if let Some(url) = public_url.take() {
+                                return Ok(url);
+                            }
+                        }
+                        if line.contains("precheck component=")
+                            || line.contains("precheck complete")
+                        {
+                            append_tunnel_log(&mut precheck_lines, line.clone());
+                        }
+                        append_tunnel_log(&mut log_lines, line);
                     }
                     None => return Err("Публичный туннель закрыл журнал запуска".to_string()),
                 },
@@ -1469,7 +1530,28 @@ async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Ch
                     let detail = status
                         .map(|status| format!("Код завершения: {status}"))
                         .unwrap_or_else(|error| error.to_string());
-                    return Err(format!("Публичный туннель завершился до создания ссылки. {detail}"));
+                    // stdout and stderr readers can still have buffered lines after the
+                    // process exits. Drain them before building the diagnostic message.
+                    let _ = timeout(Duration::from_secs(2), async {
+                        while let Some(line) = output.recv().await {
+                            if line.contains("precheck component=")
+                                || line.contains("precheck complete")
+                            {
+                                append_tunnel_log(&mut precheck_lines, line.clone());
+                            }
+                            append_tunnel_log(&mut log_lines, line);
+                        }
+                    }).await;
+                    let hint = tunnel_precheck_hint(&precheck_lines);
+                    let details = log_lines.join(" ");
+                    let message = if let Some(hint) = hint {
+                        format!("{hint} {detail}. {details}")
+                    } else if details.is_empty() {
+                        format!("Публичный туннель завершился до создания ссылки. {detail}")
+                    } else {
+                        format!("Публичный туннель завершился до создания ссылки. {detail}. {details}")
+                    };
+                    return Err(message);
                 }
             }
         }
@@ -1488,7 +1570,12 @@ async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Ch
         }
         Err(_) => {
             let _ = child.kill().await;
-            return Err("Публичная ссылка не появилась за 90 секунд. Проверьте интернет и повторите попытку".into());
+            let details = log_lines.join(" ");
+            return Err(if details.is_empty() {
+                "Публичный туннель не подключился к Cloudflare за 90 секунд. Проверьте соединение и повторите попытку".into()
+            } else {
+                format!("Публичный туннель не подключился к Cloudflare за 90 секунд. {details}")
+            });
         }
     };
     if child

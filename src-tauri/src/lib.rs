@@ -33,7 +33,7 @@ use uuid::Uuid;
 const MAX_PARTICIPANTS: usize = 10;
 const RENDEZVOUS_BASE: &str = match option_env!("CODE_WITH_ME_RENDEZVOUS_BASE") {
     Some(value) => value,
-    None => "https://176-123-162-101.sslip.io",
+    None => "https://code-with-me-app.ru",
 };
 const RUN_TIMEOUT: Duration = Duration::from_secs(15);
 const ROOM_ARCHIVE_FORMAT: &str = "code-with-me-room";

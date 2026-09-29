@@ -45,9 +45,9 @@ func (p *peer) send(value any) error {
 }
 
 type service struct {
-	mu                              sync.Mutex
-	rooms                           map[string]*room
-	publicURL, turnHost, turnSecret string
+	mu                                                         sync.Mutex
+	rooms                                                      map[string]*room
+	publicURL, legacyURL, turnHost, turnLegacyHost, turnSecret string
 }
 
 type registerRequest struct {
@@ -63,7 +63,7 @@ type signal struct {
 }
 
 func main() {
-	s := &service{rooms: map[string]*room{}, publicURL: strings.TrimRight(os.Getenv("PUBLIC_URL"), "/"), turnHost: os.Getenv("TURN_HOST"), turnSecret: os.Getenv("TURN_SECRET")}
+	s := &service{rooms: map[string]*room{}, publicURL: strings.TrimRight(os.Getenv("PUBLIC_URL"), "/"), legacyURL: strings.TrimRight(os.Getenv("LEGACY_PUBLIC_URL"), "/"), turnHost: os.Getenv("TURN_HOST"), turnLegacyHost: os.Getenv("TURN_LEGACY_HOST"), turnSecret: os.Getenv("TURN_SECRET")}
 	if s.publicURL == "" {
 		log.Fatal("PUBLIC_URL is required")
 	}
@@ -113,7 +113,12 @@ func (s *service) register(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var request registerRequest
-	if json.NewDecoder(r.Body).Decode(&request) != nil || !validToken(request.RoomID) || !validToken(request.InviteCode) || !validToken(request.HostSecret) || request.InviteURL != s.publicURL+"/?room="+request.RoomID+"&code="+request.InviteCode {
+	if json.NewDecoder(r.Body).Decode(&request) != nil || !validToken(request.RoomID) || !validToken(request.InviteCode) || !validToken(request.HostSecret) {
+		http.Error(w, "invalid room", http.StatusBadRequest)
+		return
+	}
+	path := "/?room=" + request.RoomID + "&code=" + request.InviteCode
+	if request.InviteURL != s.publicURL+path && (s.legacyURL == "" || request.InviteURL != s.legacyURL+path) {
 		http.Error(w, "invalid room", http.StatusBadRequest)
 		return
 	}
@@ -191,7 +196,11 @@ func (s *service) iceServers(id string) []map[string]any {
 	username := fmt.Sprintf("%d:%s", time.Now().Add(time.Hour).Unix(), id)
 	h := hmac.New(sha1.New, []byte(s.turnSecret))
 	h.Write([]byte(username))
-	return []map[string]any{{"urls": []string{"stun:" + s.turnHost + ":3478", "turn:" + s.turnHost + ":3478?transport=udp", "turn:" + s.turnHost + ":3478?transport=tcp"}, "username": username, "credential": base64.StdEncoding.EncodeToString(h.Sum(nil))}}
+	urls := []string{"stun:" + s.turnHost + ":3478", "turn:" + s.turnHost + ":3478?transport=udp", "turn:" + s.turnHost + ":3478?transport=tcp"}
+	if s.turnLegacyHost != "" && s.turnLegacyHost != s.turnHost {
+		urls = append(urls, "stun:"+s.turnLegacyHost+":3478", "turn:"+s.turnLegacyHost+":3478?transport=udp", "turn:"+s.turnLegacyHost+":3478?transport=tcp")
+	}
+	return []map[string]any{{"urls": urls, "username": username, "credential": base64.StdEncoding.EncodeToString(h.Sum(nil))}}
 }
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {

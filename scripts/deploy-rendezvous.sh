@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="${1:-176-123-162-101.sslip.io}"
+DOMAIN="${1:-code-with-me-app.ru}"
 SERVER="${2:-c4be@176.123.162.101}"
 PUBLIC_IP="${3:-176.123.162.101}"
+LEGACY_DOMAIN="176-123-162-101.sslip.io"
 KEY="${CODE_WITH_ME_SSH_KEY:-$HOME/.ssh/cloudru}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -31,10 +32,11 @@ scp -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$ROOT/.build/rendezvous" "$
 COPYFILE_DISABLE=1 tar -C "$ROOT" -czf "$ROOT/.build/dist.tgz" dist
 scp -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$ROOT/.build/dist.tgz" "$SERVER:code-with-me-deploy/dist.tgz"
 
-ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$SERVER" bash -s -- "$DOMAIN" "$PUBLIC_IP" <<'REMOTE'
+ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$SERVER" bash -s -- "$DOMAIN" "$PUBLIC_IP" "$LEGACY_DOMAIN" <<'REMOTE'
 set -euo pipefail
 domain="$1"
 public_ip="$2"
+legacy_domain="$3"
 sudo install -d -m 755 /opt/code-with-me
 sudo install -m 755 "$HOME/code-with-me-deploy/rendezvous" /opt/code-with-me/rendezvous
 sudo install -d -m 755 /opt/code-with-me/dist
@@ -48,7 +50,7 @@ fi
 turn_secret="$(sudo cat /etc/code-with-me/turn.secret)"
 private_ip="$(hostname -I | awk '{print $1}')"
 
-printf 'PUBLIC_URL=https://%s\nTURN_HOST=%s\nTURN_SECRET=%s\n' "$domain" "$domain" "$turn_secret" | sudo tee /etc/code-with-me/rendezvous.env >/dev/null
+printf 'PUBLIC_URL=https://%s\nLEGACY_PUBLIC_URL=https://%s\nTURN_HOST=%s\nTURN_LEGACY_HOST=%s\nTURN_SECRET=%s\n' "$domain" "$legacy_domain" "$domain" "$legacy_domain" "$turn_secret" | sudo tee /etc/code-with-me/rendezvous.env >/dev/null
 sudo chown root:c4be /etc/code-with-me/rendezvous.env
 sudo chmod 640 /etc/code-with-me/rendezvous.env
 
@@ -74,7 +76,7 @@ WantedBy=multi-user.target
 SERVICE
 
 cat <<CADDY | sudo tee /etc/caddy/Caddyfile >/dev/null
-$domain {
+$domain, $legacy_domain {
   handle /api/* {
     reverse_proxy 127.0.0.1:8787
   }
@@ -89,6 +91,9 @@ $domain {
     try_files {path} /index.html
     file_server
   }
+}
+www.$domain {
+  redir https://$domain{uri} permanent
 }
 CADDY
 

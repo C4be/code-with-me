@@ -35,7 +35,7 @@
           <span class="room-state room-idle" id="room-state"><i></i><span>Локальная комната</span></span>
           <div class="participants" id="participants" aria-label="Участники комнаты"><span class="people-count">0 / 10</span></div>
           <button class="button secondary" id="lesson-button">Сохранить занятие</button>
-          <button class="button secondary" id="invite-button" disabled>Пригласить</button>
+          <button class="button secondary hidden" id="invite-button" disabled>Пригласить</button>
           <button class="button secondary" id="start-room-button">Создать комнату</button>
           <button class="button secondary hidden" id="stop-room-button">Остановить</button>
           <button class="button secondary hidden" id="close-contest-button">Закрыть контест</button>
@@ -128,7 +128,7 @@
             <div class="output-header"><strong>ТЕРМИНАЛ</strong><span id="run-result">ГОТОВО</span><small class="local-run-note">Запуск на вашем устройстве · вывод виден только вам</small><button id="clear-output" aria-label="Очистить вывод">Очистить</button></div>
             <pre id="output-text">Нажмите «Запустить», чтобы выполнить текущее решение.</pre>
           </div>
-          <footer class="statusbar"><span>● Синхронизировано</span><span id="cursor-position">Строка 1, столбец 1</span><span id="status-language">Python</span></footer>
+          <footer class="statusbar"><span id="sync-state">● Локально</span><span id="cursor-position">Строка 1, столбец 1</span><span id="status-language">Python</span></footer>
         </section>
       </main>
 
@@ -168,6 +168,17 @@
             <button class="button secondary" id="local-copy-button">Создать локальную копию</button>
             <input id="room-file-input" type="file" accept=".cwmroom,application/json" hidden />
             <p>Локальная комната работает без сервера и подключений.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="disconnected-modal" role="dialog" aria-modal="true" aria-labelledby="disconnected-title">
+        <div class="modal-card disconnected-card">
+          <div class="modal-header"><div><span>СОЕДИНЕНИЕ ЗАВЕРШЕНО</span><h2 id="disconnected-title">Связь с ведущим прервана</h2></div></div>
+          <p>Изменения больше не синхронизируются. Код и задания пока доступны только в этом окне. Сохраните контест, чтобы не потерять их при выходе.</p>
+          <div class="disconnected-actions">
+            <button class="button primary" id="save-disconnected-button">Сохранить контест</button>
+            <button class="button secondary" id="leave-disconnected-button">Выйти без сохранения</button>
           </div>
         </div>
       </div>

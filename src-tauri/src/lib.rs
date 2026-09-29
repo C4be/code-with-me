@@ -110,6 +110,8 @@ struct RoomQuery {
 struct FileQuery {
     code: String,
     path: String,
+    writer: Option<String>,
+    revision: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1902,7 +1904,7 @@ async fn write_file(
     }
     let _ = room
         .events
-        .send(json!({"type":"file:saved", "path":query.path, "content":body}));
+        .send(json!({"type":"file:saved", "path":query.path, "content":body, "writer":query.writer, "revision":query.revision}));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2273,6 +2275,15 @@ async fn handle_socket(
                     let Ok(mut event) = serde_json::from_str::<Value>(&text) else { continue; };
                     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
                     if kind == "presence" {
+                        if let Some(object) = event.as_object_mut() { object.insert("participantId".into(), json!(id)); }
+                        let _ = room.events.send(event);
+                    } else if kind == "code:change" {
+                        let path = event.get("path").and_then(Value::as_str).unwrap_or("");
+                        let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                        let revision = event.get("revision").and_then(Value::as_u64).unwrap_or(0);
+                        if path.len() > 200 || content.len() > 1024 * 1024 || revision == 0 { continue; }
+                        let Ok(target) = safe_path(&room.root, path) else { continue; };
+                        if !is_code_file(&target) { continue; }
                         if let Some(object) = event.as_object_mut() { object.insert("participantId".into(), json!(id)); }
                         let _ = room.events.send(event);
                     } else if kind == "rename" {

@@ -184,6 +184,12 @@ func (s *service) delete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	for _, p := range peers {
+		if p.conn == nil {
+			continue
+		}
+		if p != room.host {
+			_ = p.send(map[string]any{"type": "room-ended"})
+		}
 		p.conn.Close()
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -291,11 +297,12 @@ func (s *service) connect(w http.ResponseWriter, r *http.Request) {
 
 func (s *service) remove(room *room, p *peer, host bool) {
 	s.mu.Lock()
+	guestsToClose := []*peer{}
 	if host && room.host == p {
 		room.host = nil
 		delete(s.rooms, room.id)
 		for _, guest := range room.guests {
-			guest.conn.Close()
+			guestsToClose = append(guestsToClose, guest)
 		}
 	}
 	if !host && room.guests[p.id] == p {
@@ -303,6 +310,12 @@ func (s *service) remove(room *room, p *peer, host bool) {
 	}
 	owner := room.host
 	s.mu.Unlock()
+	for _, guest := range guestsToClose {
+		if guest.conn != nil {
+			_ = guest.send(map[string]any{"type": "room-ended"})
+			guest.conn.Close()
+		}
+	}
 	if !host && owner != nil && owner.conn != nil {
 		owner.send(map[string]any{"type": "peer-left", "peerId": p.id})
 	}

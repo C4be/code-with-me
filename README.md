@@ -60,6 +60,8 @@ pnpm dev
 
 На macOS и Linux также доступен скрипт `bash scripts/build-desktop.sh`. В Windows используйте `build-windows.cmd` или `scripts/build-desktop.ps1`.
 
+Сборка macOS без сертификата Developer ID получает ad hoc подпись. Для передачи приложения другим пользователям без предупреждений Gatekeeper нужен сертификат **Developer ID Application** и нотариализация Apple. Tauri принимает сертификат из связки ключей через `APPLE_SIGNING_IDENTITY`, а данные нотариализации через `APPLE_API_ISSUER`, `APPLE_API_KEY` и `APPLE_API_KEY_PATH` либо `APPLE_ID`, `APPLE_PASSWORD` и `APPLE_TEAM_ID`. Секреты не добавляйте в репозиторий. Проверить готовый пакет можно командами `codesign --verify --deep --strict /path/to/Code\ with\ me.app` и `spctl --assess --verbose /path/to/Code\ with\ me.app`.
+
 Сборки для всех трёх систем выполняются автоматически через GitHub Actions при push в `main`, pull request и вручную. Готовые установщики сохраняются как артефакты запуска workflow **Desktop builds**.
 
 ## Формат комнаты

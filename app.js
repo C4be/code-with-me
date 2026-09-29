@@ -76,18 +76,27 @@ let completionRevision = 0;
 let activeSuggestion = null;
 let completionRequestInFlight = false;
 const saveTimers = new Map();
+const liveTimers = new Map();
+const pendingWrites = new Map();
+const localRevisions = new Map();
+const seenRemoteRevisions = new Map();
 const presence = new Map();
+const remoteActivity = new Map();
+let presenceTimer = 0;
+let pendingPresenceActive = false;
 const roomState = {
   base: "",
   code: "",
   inviteUrl: "",
   host: false,
   local: true,
+  disconnected: false,
   socket: null,
   transport: null,
   participantId: "",
   selfName: "",
   participants: [],
+  peerRoutes: new Map(),
 };
 
 const codeInput = $("#code-input");
@@ -175,7 +184,7 @@ function syncEditorFromRemote(content) {
   codeInput.setSelectionRange(Math.min(start, content.length), Math.min(end, content.length), direction);
   updateCursorStatus();
   renderRemoteCursors();
-  sendPresence();
+  sendPresence(false);
 }
 
 async function notifyDisconnected() {
@@ -368,6 +377,7 @@ function renderRoomParticipants(participants = roomState.participants) {
   roomState.participants = participants;
   const liveIds = new Set(participants.map((person) => person.id));
   for (const id of presence.keys()) if (!liveIds.has(id)) presence.delete(id);
+  for (const id of remoteActivity.keys()) if (!liveIds.has(id)) remoteActivity.delete(id);
   const container = $("#participants");
   container.innerHTML = participants
     .map((person) => `<span class="avatar" style="background:${colorForId(person.id)};color:#fff" title="${escapeHTML(person.name)}${person.host ? " · ведущий" : ""}">${escapeHTML(initials(person.name))}</span>`)
@@ -703,22 +713,47 @@ function renderRemoteCursors() {
     caret.style.top = `${(before.length - 1) * editorLineHeight()}px`;
     caret.style.left = `${before.at(-1).length * editorFontSize * 0.602}px`;
     caret.innerHTML = `<span>${escapeHTML(participant.name)}</span>`;
+    const elapsed = Date.now() - (remoteActivity.get(participantId) || 0);
+    if (elapsed >= 3000) caret.querySelector("span").classList.add("quiet");
+    else caret.querySelector("span").style.animationDelay = `-${Math.max(0, elapsed)}ms`;
     container.append(caret);
   }
 }
 
-function sendPresence() {
+function sendPresence(active = true) {
   if (!roomState.socket || roomState.socket.readyState !== WebSocket.OPEN || !activeFile) return;
-  roomState.socket.send(JSON.stringify({
-    type: "presence",
-    file: activeFile,
-    cursorStart: codeInput.selectionStart,
-    cursorEnd: codeInput.selectionEnd,
-  }));
+  pendingPresenceActive ||= active;
   if (roomState.participantId) {
+    const previousFile = presence.get(roomState.participantId)?.file;
     presence.set(roomState.participantId, { file: activeFile, cursorStart: codeInput.selectionStart, cursorEnd: codeInput.selectionEnd });
+    if (previousFile !== activeFile) renderSolutionTabs();
   }
-  renderSolutionTabs();
+  clearTimeout(presenceTimer);
+  presenceTimer = setTimeout(() => {
+    presenceTimer = 0;
+    if (roomState.socket?.readyState !== WebSocket.OPEN || !activeFile) return;
+    const wasActive = pendingPresenceActive;
+    pendingPresenceActive = false;
+    roomState.socket.send(JSON.stringify({
+      type: "presence",
+      file: activeFile,
+      cursorStart: codeInput.selectionStart,
+      cursorEnd: codeInput.selectionEnd,
+      active: wasActive,
+    }));
+  }, 45);
+}
+
+function sendLiveChange(path) {
+  if (!roomState.code || !roomState.socket || roomState.socket.readyState !== WebSocket.OPEN) return;
+  const revision = (localRevisions.get(path) || 0) + 1;
+  localRevisions.set(path, revision);
+  clearTimeout(liveTimers.get(path));
+  liveTimers.set(path, setTimeout(() => {
+    liveTimers.delete(path);
+    if (roomState.socket?.readyState !== WebSocket.OPEN) return;
+    roomState.socket.send(JSON.stringify({ type: "code:change", path, content: files[path], revision }));
+  }, 35));
 }
 
 function activateSolution(path, selectTask = true) {
@@ -796,18 +831,35 @@ async function loadWorkspace() {
   refreshEditor(false);
 }
 
-async function persistFile(path, content) {
-  if (roomState.code) {
-    return roomFetch("/api/file", { method: "PUT", headers: { "Content-Type": "text/plain" }, body: content }, { path });
-  }
-  const invoke = window.__TAURI__?.core?.invoke;
-  if (invoke) return invoke("save_project_file", { path, content });
+async function persistFile(path, content, revision = localRevisions.get(path)) {
+  const roomCode = roomState.code;
+  const previous = pendingWrites.get(path) || Promise.resolve();
+  const write = previous.catch(() => {}).then(() => {
+    if (roomCode) {
+      if (roomState.code !== roomCode) throw new Error("Соединение с комнатой завершено");
+      const query = { path };
+      if (roomState.participantId) query.writer = roomState.participantId;
+      if (revision) query.revision = revision;
+      return roomFetch("/api/file", { method: "PUT", headers: { "Content-Type": "text/plain" }, body: content }, query);
+    }
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) return invoke("save_project_file", { path, content });
+  });
+  pendingWrites.set(path, write);
+  try { return await write; }
+  finally { if (pendingWrites.get(path) === write) pendingWrites.delete(path); }
 }
 
 function schedulePersist(path, content, isTask = false) {
+  if (roomState.disconnected && !window.__TAURI__?.core?.invoke) {
+    $("#sync-state").textContent = "● Новые правки не сохранены";
+    if (isTask) $("#task-save-state").textContent = "● Не сохранено";
+    return;
+  }
   clearTimeout(saveTimers.get(path));
   if (isTask) $("#task-save-state").textContent = "● Сохраняется…";
   saveTimers.set(path, setTimeout(async () => {
+    saveTimers.delete(path);
     try {
       await persistFile(path, content);
       if (isTask && path === currentTaskFile) $("#task-save-state").textContent = "● Сохранено";
@@ -1075,19 +1127,57 @@ async function runCode() {
   }
 }
 
-function setRoomChrome(label, online, local = false) {
+function setRoomChrome(label, online, local = false, detail = "") {
+  document.body.classList.toggle("is-browser-guest", !window.__TAURI__?.core?.invoke && (online || roomState.disconnected));
+  $("#sync-state").textContent = online ? "● Синхронизировано" : roomState.disconnected ? "● Сохраните контест" : "● Локально";
+  if (roomState.disconnected) $("#task-save-state").textContent = "● Только в этом окне";
   const state = $("#room-state");
   state.classList.toggle("room-idle", !online);
   state.querySelector("span").textContent = label;
-  $("#invite-button").disabled = !online;
-  $("#start-room-button").classList.toggle("hidden", online);
+  state.title = detail;
+  const mayInvite = online && roomState.host;
+  $("#invite-button").disabled = !mayInvite;
+  $("#invite-button").classList.toggle("hidden", !mayInvite);
+  $("#start-room-button").classList.toggle("hidden", online || !window.__TAURI__?.core?.invoke);
   $("#stop-room-button").classList.toggle("hidden", !online || !roomState.host);
   $("#close-contest-button").classList.remove("hidden");
   roomState.local = local;
 }
 
+function updateHostRouteChrome() {
+  if (!roomState.host) return;
+  const routes = [...roomState.peerRoutes.values()];
+  if (!routes.length) { setRoomChrome("Комната запущена", true); return; }
+  const direct = routes.filter((route) => route.kind === "direct").length;
+  const relay = routes.length - direct;
+  const label = routes.length === 1
+    ? direct ? "Гость напрямую" : "Гость через сервер"
+    : `${direct} напрямую · ${relay} через сервер`;
+  const detail = routes.map((route) => `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`).join("; ");
+  setRoomChrome(label, true, false, detail);
+}
+
+function applyRoomFileEvent(message) {
+  const path = message.path;
+  if (typeof path !== "string" || typeof message.content !== "string") return;
+  const writer = message.participantId || message.writer;
+  if (writer && writer === roomState.participantId) return;
+  if (writer && message.type === "code:change") remoteActivity.set(writer, Date.now());
+  const revision = Number(message.revision) || 0;
+  const revisionKey = writer ? `${writer}\0${path}` : "";
+  if (revisionKey && revision) {
+    if (revision <= (seenRemoteRevisions.get(revisionKey) || 0)) return;
+    seenRemoteRevisions.set(revisionKey, revision);
+  }
+  files[path] = message.content;
+  if (path === activeFile && codeInput.value !== message.content) syncEditorFromRemote(message.content);
+  renderRemoteCursors();
+  if (path === currentTaskFile && !$("#task-form").contains(document.activeElement) && document.activeElement !== $("#task-source-input")) renderTask();
+}
+
 async function connectRoom(info, host = false, guestName = "") {
   roomState.local = false;
+  roomState.disconnected = false;
   roomState.base = host && info.localBase ? info.localBase : new URL(info.inviteUrl).origin;
   roomState.code = info.inviteCode;
   roomState.inviteUrl = info.inviteUrl;
@@ -1102,6 +1192,15 @@ async function connectRoom(info, host = false, guestName = "") {
   if (host) {
     if (!info.localBase || !info.hostSecret) throw new Error("Приложение не получило локальный адрес или ключ ведущего");
     const bridge = new HostBridge(info);
+    bridge.onRoute = (id, route) => {
+      if (roomState.transport !== bridge) return;
+      roomState.peerRoutes.set(id, route);
+      updateHostRouteChrome();
+    };
+    bridge.onPeerClose = (id) => {
+      roomState.peerRoutes.delete(id);
+      if (roomState.transport === bridge) updateHostRouteChrome();
+    };
     await bridge.connect();
     roomState.transport = bridge;
     const socketUrl = new URL("/ws", roomState.base);
@@ -1114,7 +1213,9 @@ async function connectRoom(info, host = false, guestName = "") {
   } else {
     const transport = new GuestTransport(info);
     transport.onRoute = (route) => {
-      if (roomState.transport === transport) setRoomChrome(route === "relay" ? "Соединение через сервер" : "Прямое соединение", true);
+      if (roomState.transport !== transport) return;
+      const detail = `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`;
+      setRoomChrome(`${route.kind === "relay" ? "Через сервер" : "Напрямую"}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`, true, false, detail);
     };
     roomState.transport = transport;
     socket = await transport.connect(roomState.selfName);
@@ -1122,6 +1223,7 @@ async function connectRoom(info, host = false, guestName = "") {
   roomState.socket = socket;
   await new Promise((resolve, reject) => {
     let ready = false;
+    const pendingFileEvents = [];
     socket.onmessage = async (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
@@ -1131,6 +1233,8 @@ async function connectRoom(info, host = false, guestName = "") {
         renderRoomParticipants(message.room.participants || []);
         try {
           await loadWorkspace();
+          for (const pending of pendingFileEvents) applyRoomFileEvent(pending);
+          pendingFileEvents.length = 0;
           if (!host) showWorkspace();
           ready = true;
           sendPresence();
@@ -1142,17 +1246,15 @@ async function connectRoom(info, host = false, guestName = "") {
       }
       if (message.type === "participants") renderRoomParticipants(message.participants || []);
       if (message.type === "presence" && message.participantId) {
+        const previousFile = presence.get(message.participantId)?.file;
+        if (message.active !== false) remoteActivity.set(message.participantId, Date.now());
         presence.set(message.participantId, message);
-        renderSolutionTabs();
+        if (previousFile !== message.file) renderSolutionTabs();
         renderRemoteCursors();
       }
-      if (message.type === "file:saved") {
-        files[message.path] = message.content;
-        if (message.path === activeFile && codeInput.value !== message.content) {
-          syncEditorFromRemote(message.content);
-        }
-        renderRemoteCursors();
-        if (message.path === currentTaskFile && !$("#task-form").contains(document.activeElement) && document.activeElement !== $("#task-source-input")) renderTask();
+      if (message.type === "file:saved" || message.type === "code:change") {
+        if (ready) applyRoomFileEvent(message);
+        else pendingFileEvents.push(message);
       }
       if (message.type === "file:created" || message.type === "file:renamed" || message.type === "file:deleted") await loadWorkspace();
     };
@@ -1166,7 +1268,9 @@ async function connectRoom(info, host = false, guestName = "") {
       }
       if (!host && roomState.socket === socket) {
         resetRoomConnection();
-        setRoomChrome("Соединение прервано", false);
+        roomState.disconnected = true;
+        setRoomChrome("Локально · сохраните контест", false, true);
+        $("#disconnected-modal").classList.remove("hidden");
         notifyDisconnected();
       }
     };
@@ -1204,22 +1308,36 @@ async function startRoom() {
 
 function resetRoomConnection() {
   const socket = roomState.socket;
+  for (const timer of saveTimers.values()) clearTimeout(timer);
+  saveTimers.clear();
   roomState.transport?.close();
   roomState.transport = null;
   roomState.base = "";
   roomState.code = "";
   roomState.inviteUrl = "";
   roomState.host = false;
+  roomState.disconnected = false;
   roomState.participantId = "";
   roomState.participants = [];
+  roomState.peerRoutes.clear();
+  for (const timer of liveTimers.values()) clearTimeout(timer);
+  liveTimers.clear();
+  clearTimeout(presenceTimer);
+  presenceTimer = 0;
+  pendingPresenceActive = false;
+  localRevisions.clear();
+  seenRemoteRevisions.clear();
   roomState.socket = null;
   presence.clear();
+  remoteActivity.clear();
   socket?.close();
   renderRoomParticipants([]);
 }
 
 async function stopRoom() {
   try {
+    if (activeFile) files[activeFile] = codeInput.value;
+    await persistWorkspace();
     await window.__TAURI__?.core?.invoke("stop_room");
     resetRoomConnection();
     setRoomChrome("Локальная комната", false, true);
@@ -1298,13 +1416,14 @@ async function submitJoin(event) {
 }
 
 function showInvite() {
-  if (!roomState.inviteUrl) return;
+  if (!roomState.host || !roomState.inviteUrl) return;
   $("#invite-link").value = roomState.inviteUrl;
   $("#invite-modal").classList.remove("hidden");
   setTimeout(() => $("#invite-link").select(), 20);
 }
 
 async function copyInvite() {
+  if (!roomState.host) return;
   try {
     await navigator.clipboard.writeText(roomState.inviteUrl);
     showToast("Ссылка скопирована");
@@ -1325,12 +1444,66 @@ function downloadText(contents, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function serializeCurrentRoom(mode = "snapshot") {
+  return JSON.stringify({
+    format: "code-with-me-room",
+    version: 1,
+    mode,
+    name: parseChallenge(files[currentTaskFile] || "").title || "code-with-me",
+    files: Object.entries(files).map(([path, content]) => ({
+      path, kind: "file", encoding: "utf8", content: mode === "template" && isCodeFile(path) ? "" : content,
+    })),
+  }, null, 2);
+}
+
+async function saveDisconnectedContest() {
+  if (activeFile) files[activeFile] = codeInput.value;
+  const archive = serializeCurrentRoom();
+  const button = $("#save-disconnected-button");
+  button.disabled = true;
+  try {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      const name = await invoke("import_room_archive", { archive });
+      await loadWorkspace();
+      roomState.disconnected = false;
+      setRoomChrome("Локальная копия", false, true);
+      $("#sync-state").textContent = "● Сохранено локально";
+      showToast(`Контест сохранён локально: ${name}`);
+    } else {
+      downloadText(archive, "code-with-me-snapshot.cwmroom");
+      setRoomChrome("Локально · сохраняйте копию", false, true);
+      $("#sync-state").textContent = "● Копия скачана";
+      $("#task-save-state").textContent = "● Копия скачана";
+      showToast("Контест скачан. При дальнейших правках скачайте новую копию.");
+    }
+    $("#disconnected-modal").classList.add("hidden");
+  } catch (error) { showToast(`Не удалось сохранить контест: ${error.message || error}`, 6000); }
+  finally { button.disabled = false; }
+}
+
+async function leaveDisconnectedRoom() {
+  $("#disconnected-modal").classList.add("hidden");
+  roomState.disconnected = false;
+  files = { "task.cwm.md": initialTask, "0.solution-0.py": initialSolution };
+  currentTaskFile = "task.cwm.md";
+  activeFile = "0.solution-0.py";
+  setRoomChrome("Главное меню", false, true);
+  $(".workspace").classList.add("hidden");
+  $("#home-view").classList.remove("hidden");
+  $(".course-title").textContent = "";
+  $("#close-contest-button").classList.add("hidden");
+  await refreshContestList();
+}
+
 async function exportLesson(mode) {
   try {
     if (activeFile) files[activeFile] = codeInput.value;
-    await persistWorkspace();
+    if (!roomState.disconnected) await persistWorkspace();
     const name = `code-with-me-${mode === "template" ? "tasks" : "snapshot"}.cwmroom`;
-    if (roomState.code) {
+    if (roomState.disconnected) {
+      downloadText(serializeCurrentRoom(mode), name);
+    } else if (roomState.code) {
       if (roomState.transport instanceof GuestTransport) {
         downloadText(await roomState.transport.request("/api/export", {}, { mode }), name);
       } else {
@@ -1344,14 +1517,7 @@ async function exportLesson(mode) {
     } else if (window.__TAURI__?.core?.invoke) {
       downloadText(await window.__TAURI__.core.invoke("export_room_archive", { mode }), name);
     } else {
-      const archive = {
-        format: "code-with-me-room",
-        version: 1,
-        mode,
-        name: "code-with-me",
-        files: Object.entries(files).map(([path, content]) => ({ path, kind: "file", encoding: "utf8", content: mode === "template" && isCodeFile(path) ? "" : content })),
-      };
-      downloadText(JSON.stringify(archive, null, 2), name);
+      downloadText(serializeCurrentRoom(mode), name);
     }
     $("#lesson-modal").classList.add("hidden");
     showToast(mode === "template" ? "Задачи сохранены без решений" : "Состояние занятия сохранено");
@@ -1412,14 +1578,15 @@ async function refreshContestList() {
   const saved = $("#saved-contest-list");
   if (!mine || !saved) return;
   let rooms = [];
-  if (window.__TAURI__?.core?.invoke) {
+  const isDesktop = Boolean(window.__TAURI__?.core?.invoke);
+  if (isDesktop) {
     try { rooms = await window.__TAURI__.core.invoke("list_local_rooms"); } catch (error) { console.warn("Не удалось загрузить контесты", error); }
   }
-  if (!rooms.length) rooms = [{ name: parseChallenge(files["task.cwm.md"] || initialTask).title || "Моё занятие", folder: "workspace", taskCount: taskFiles().length, category: "my" }];
+  if (!rooms.length && isDesktop) rooms = [{ name: parseChallenge(files["task.cwm.md"] || initialTask).title || "Моё занятие", folder: "workspace", taskCount: taskFiles().length, category: "my" }];
   const card = (room) => `<article class="contest-card"><span class="contest-card-icon">⌘</span><span class="contest-card-copy"><strong>${escapeHTML(room.name)}</strong><small>${room.taskCount} ${room.taskCount === 1 ? "задание" : "заданий"}</small></span><div class="contest-card-actions"><button class="contest-card-action open" data-contest-folder="${escapeHTML(room.folder)}">Открыть</button><button class="contest-card-action" data-export-folder="${escapeHTML(room.folder)}" data-export-name="${escapeHTML(room.name)}">Скачать</button>${room.folder === "workspace" ? "" : `<button class="contest-card-action delete" data-delete-folder="${escapeHTML(room.folder)}" data-delete-name="${escapeHTML(room.name)}">Удалить</button>`}</div></article>`;
   const ownRooms = rooms.filter((room) => room.category === "my");
   const savedRooms = rooms.filter((room) => room.category !== "my");
-  mine.innerHTML = ownRooms.length ? ownRooms.map(card).join("") : `<p class="empty-state">Пока нет своих контестов. Создайте новый кнопкой выше.</p>`;
+  mine.innerHTML = ownRooms.length ? ownRooms.map(card).join("") : `<p class="empty-state">${isDesktop ? "Пока нет своих контестов. Создайте новый кнопкой выше." : "В браузере контесты не хранятся. Откройте приглашение или скачайте настольное приложение."}</p>`;
   saved.innerHTML = savedRooms.length ? savedRooms.map(card).join("") : `<p class="empty-state">Здесь появятся импортированные файлы и сохранённые занятия.</p>`;
   await refreshDependencies();
 }
@@ -1529,6 +1696,7 @@ async function exportLocalContest(folder, name) {
 
 async function showHome() {
   if (activeFile && codeInput.value !== files[activeFile]) files[activeFile] = codeInput.value;
+  if (roomState.disconnected) { $("#disconnected-modal").classList.remove("hidden"); return; }
   try { await persistWorkspace(); } catch (error) { showToast(`Не удалось сохранить: ${error.message || error}`); return; }
   const stopHostedRoom = roomState.host;
   if (roomState.socket) resetRoomConnection();
@@ -1728,6 +1896,7 @@ function init() {
     $("#line-numbers").innerHTML = Array.from({ length: count }, (_, index) => index + 1).join("<br>");
     codeInput.style.height = `${Math.max($("#code-wrap").clientHeight - 35, count * editorLineHeight())}px`;
     schedulePersist(activeFile, codeInput.value);
+    sendLiveChange(activeFile);
     updateCursorStatus();
     updateCompletion();
     sendPresence();
@@ -1761,6 +1930,8 @@ function init() {
   $("#copy-invite-button").addEventListener("click", copyInvite);
   $("#join-form").addEventListener("submit", submitJoin);
   $("#lesson-button").addEventListener("click", () => $("#lesson-modal").classList.remove("hidden"));
+  $("#save-disconnected-button").addEventListener("click", saveDisconnectedContest);
+  $("#leave-disconnected-button").addEventListener("click", leaveDisconnectedRoom);
   $$("[data-export-mode]").forEach((button) => button.addEventListener("click", () => exportLesson(button.dataset.exportMode)));
   $("#open-room-file").addEventListener("click", () => $("#room-file-input").click());
   $("#room-file-input").addEventListener("change", importRoomFile);

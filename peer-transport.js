@@ -29,6 +29,46 @@ function waitForOpen(socket) {
   });
 }
 
+async function selectedRoute(pc) {
+  const stats = await pc.getStats();
+  const values = [...stats.values()];
+  const transport = values.find((item) => item.type === "transport" && item.selectedCandidatePairId);
+  const pair = stats.get(transport?.selectedCandidatePairId)
+    || values.find((item) => item.type === "candidate-pair" && (item.selected || (item.nominated && item.state === "succeeded")));
+  if (!pair) return null;
+  const local = stats.get(pair.localCandidateId);
+  const remote = stats.get(pair.remoteCandidateId);
+  if (!local?.candidateType || !remote?.candidateType) return null;
+  return {
+    kind: local.candidateType === "relay" || remote.candidateType === "relay" ? "relay" : "direct",
+    localType: local.candidateType,
+    remoteType: remote.candidateType,
+    rttMs: Number.isFinite(pair.currentRoundTripTime) ? Math.round(pair.currentRoundTripTime * 1000) : null,
+  };
+}
+
+function observeRoute(pc, onRoute) {
+  let active = true;
+  let timer = 0;
+  let attempts = 0;
+  let last = "";
+  const sample = async () => {
+    if (!active || pc.connectionState === "closed") return;
+    try {
+      const route = await selectedRoute(pc);
+      if (route) {
+        const current = JSON.stringify(route);
+        if (current !== last) { last = current; onRoute(route); }
+        timer = setTimeout(sample, 4000);
+        return;
+      }
+    } catch { /* Some WebViews expose candidate stats only after ICE settles. */ }
+    if (++attempts < 12) timer = setTimeout(sample, 500);
+  };
+  sample();
+  return () => { active = false; clearTimeout(timer); };
+}
+
 class PacketChannel {
   constructor(channel, onMessage) {
     this.channel = channel;
@@ -104,12 +144,15 @@ export class HostBridge {
 
   async addPeer(id) {
     const pc = new RTCPeerConnection({ iceServers: this.iceServers || [] });
-    const peer = { pc, candidates: [], roomSocket: null, packets: null };
+    const peer = { pc, candidates: [], roomSocket: null, packets: null, stopRoute: null };
     this.peers.set(id, peer);
     pc.onicecandidate = ({ candidate }) => { if (candidate) this.sendSignal({ type: "ice", to: id, candidate }); };
     pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState)) this.closePeer(id); };
     const channel = pc.createDataChannel("room", { ordered: true });
-    channel.onopen = () => { peer.packets = new PacketChannel(channel, (message) => this.handlePacket(peer, message)); };
+    channel.onopen = () => {
+      peer.packets = new PacketChannel(channel, (message) => this.handlePacket(peer, message));
+      peer.stopRoute = observeRoute(pc, (route) => this.onRoute?.(id, route));
+    };
     try {
       await pc.setLocalDescription(await pc.createOffer());
       this.sendSignal({ type: "offer", to: id, description: pc.localDescription });
@@ -148,8 +191,16 @@ export class HostBridge {
     if (message.type === "ws-close") peer.roomSocket?.close();
   }
 
-  closePeer(id) { const peer = this.peers.get(id); if (!peer) return; peer.roomSocket?.close(); peer.pc.close(); this.peers.delete(id); }
-  close() { this.socket?.close(); for (const id of this.peers.keys()) this.closePeer(id); }
+  closePeer(id) { const peer = this.peers.get(id); if (!peer) return; peer.stopRoute?.(); peer.roomSocket?.close(); peer.pc.close(); this.peers.delete(id); this.onPeerClose?.(id); }
+  close() {
+    this.socket?.close();
+    for (const [id, peer] of this.peers) {
+      if (peer.packets) {
+        peer.packets.send({ type: "room-ended" }).catch(() => {});
+        setTimeout(() => this.closePeer(id), 400);
+      } else this.closePeer(id);
+    }
+  }
 }
 
 export class GuestTransport {
@@ -188,6 +239,13 @@ export class GuestTransport {
       this.socket.onmessage = async (event) => {
         const message = JSON.parse(event.data);
         try {
+          if (message.type === "room-ended") {
+            clearTimeout(timer);
+            this.virtualSocket.readyState = WebSocket.CLOSED;
+            this.virtualSocket.onclose?.();
+            reject(new Error("Ведущий завершил комнату"));
+            return;
+          }
           if (message.type === "hello") { this.iceServers = message.iceServers; return; }
           if (message.type === "offer") { await this.acceptOffer(message); return; }
           if (message.type === "ice") {
@@ -205,23 +263,14 @@ export class GuestTransport {
     this.hostId = message.from;
     const pc = new RTCPeerConnection({ iceServers: this.iceServers || [] });
     this.pc = pc;
-    pc.onconnectionstatechange = async () => {
-      if (pc.connectionState === "connected") {
-        try {
-          const stats = await pc.getStats();
-          const transport = [...stats.values()].find((item) => item.type === "transport" && item.selectedCandidatePairId);
-          const pair = stats.get(transport?.selectedCandidatePairId) || [...stats.values()].find((item) => item.type === "candidate-pair" && item.selected);
-          if (!pair) return;
-          const local = stats.get(pair.localCandidateId);
-          const remote = stats.get(pair.remoteCandidateId);
-          this.onRoute?.(local?.candidateType === "relay" || remote?.candidateType === "relay" ? "relay" : "direct");
-        } catch { /* Route detection is only a visual hint. */ }
-      }
+    pc.onconnectionstatechange = () => {
+      if (["failed", "closed"].includes(pc.connectionState)) this.virtualSocket.onclose?.();
     };
     pc.onicecandidate = ({ candidate }) => { if (candidate && this.socket.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: "ice", to: this.hostId, candidate })); };
     pc.ondatachannel = ({ channel }) => {
       channel.onopen = () => {
         this.packets = new PacketChannel(channel, (packet) => this.handlePacket(packet));
+        this.stopRoute = observeRoute(pc, (route) => this.onRoute?.(route));
         this.virtualSocket.readyState = WebSocket.OPEN;
         this.packets.send({ type: "ws-open", name: this.name });
         this.ready();
@@ -236,6 +285,7 @@ export class GuestTransport {
   }
 
   handlePacket(packet) {
+    if (packet.type === "room-ended") { this.virtualSocket.readyState = WebSocket.CLOSED; this.virtualSocket.onclose?.(); return; }
     if (packet.type === "ws-event") {
       if (this.virtualSocket.onmessage) this.virtualSocket.onmessage({ data: packet.data });
       else this.pendingEvents.push(packet.data);
@@ -254,5 +304,5 @@ export class GuestTransport {
     });
   }
 
-  close() { this.virtualSocket.readyState = WebSocket.CLOSED; this.pc?.close(); this.socket?.close(); for (const pending of this.pending.values()) pending({ status: 503, body: "Соединение закрыто" }); this.pending.clear(); }
+  close() { this.stopRoute?.(); this.virtualSocket.readyState = WebSocket.CLOSED; this.pc?.close(); this.socket?.close(); for (const pending of this.pending.values()) pending({ status: 503, body: "Соединение закрыто" }); this.pending.clear(); }
 }

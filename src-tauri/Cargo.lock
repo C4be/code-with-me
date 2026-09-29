@@ -584,12 +584,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
- "flate2",
  "futures-util",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

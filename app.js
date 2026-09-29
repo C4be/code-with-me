@@ -1,3 +1,5 @@
+import { HostBridge, GuestTransport } from "./peer-transport.js";
+
 let isPermissionGranted = async () => false;
 let requestPermission = async () => "denied";
 let sendNotification = () => {};
@@ -77,6 +79,7 @@ const roomState = {
   host: false,
   local: true,
   socket: null,
+  transport: null,
   participantId: "",
   selfName: "",
   participants: [],
@@ -669,6 +672,10 @@ function roomApiUrl(path, query = {}) {
 }
 
 async function roomFetch(path, options = {}, query = {}) {
+  if (roomState.transport instanceof GuestTransport) {
+    const body = await roomState.transport.request(path, options, query);
+    return body ? JSON.parse(body) : null;
+  }
   const response = await fetch(roomApiUrl(path, query), options);
   if (!response.ok) throw new Error((await response.text()) || `Ошибка комнаты (${response.status})`);
   if (response.status === 204) return null;
@@ -1011,12 +1018,28 @@ async function connectRoom(info, host = false, guestName = "") {
   setRoomChrome(host ? "Комната запущена" : "Вы в комнате", true);
   renderRoomParticipants();
   roomState.socket?.close();
-  const socketUrl = new URL("/ws", roomState.base);
-  socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
-  socketUrl.searchParams.set("code", roomState.code);
-  socketUrl.searchParams.set("name", roomState.selfName);
-  socketUrl.searchParams.set("host", String(host));
-  const socket = new WebSocket(socketUrl);
+  roomState.transport?.close();
+  let socket;
+  if (host) {
+    if (!info.localBase || !info.hostSecret) throw new Error("Приложение не получило локальный адрес или ключ ведущего");
+    const bridge = new HostBridge(info);
+    await bridge.connect();
+    roomState.transport = bridge;
+    const socketUrl = new URL("/ws", roomState.base);
+    socketUrl.protocol = "ws:";
+    socketUrl.searchParams.set("code", roomState.code);
+    socketUrl.searchParams.set("name", roomState.selfName);
+    socketUrl.searchParams.set("host", "true");
+    socketUrl.searchParams.set("hostSecret", info.hostSecret);
+    socket = new WebSocket(socketUrl);
+  } else {
+    const transport = new GuestTransport(info);
+    transport.onRoute = (route) => {
+      if (roomState.transport === transport) setRoomChrome(route === "relay" ? "Соединение через сервер" : "Прямое соединение", true);
+    };
+    roomState.transport = transport;
+    socket = await transport.connect(roomState.selfName);
+  }
   roomState.socket = socket;
   await new Promise((resolve, reject) => {
     let ready = false;
@@ -1082,12 +1105,17 @@ async function startRoom() {
   button.disabled = true;
   button.textContent = "Подключаем…";
   showToast("Подготавливаем публичную ссылку…", 90000);
+  let started = false;
   try {
     await persistWorkspace();
     const info = await invoke("start_room");
+    started = true;
     await connectRoom(info, true);
     showToast("Комната запущена");
   } catch (error) {
+    if (started) await invoke("stop_room").catch(() => {});
+    resetRoomConnection();
+    setRoomChrome("Локальная комната", false, true);
     showToast(`Не удалось создать комнату: ${error}`);
   } finally {
     button.disabled = false;
@@ -1097,6 +1125,8 @@ async function startRoom() {
 
 function resetRoomConnection() {
   const socket = roomState.socket;
+  roomState.transport?.close();
+  roomState.transport = null;
   roomState.base = "";
   roomState.code = "";
   roomState.inviteUrl = "";
@@ -1126,11 +1156,16 @@ async function prepareInvite(urlText) {
     throw new Error("Нужна HTTP или HTTPS ссылка-приглашение");
   }
   const code = invite.searchParams.get("code");
+  const roomId = invite.searchParams.get("room");
   if (!code || code.length > 128) throw new Error("В ссылке не найден код комнаты");
+  if (!roomId || roomId.length > 128) throw new Error("В ссылке не найден номер комнаты");
   roomState.base = invite.origin;
   roomState.code = code;
-  const info = await roomFetch("/api/room");
+  const response = await fetch(new URL(`/api/rooms/${encodeURIComponent(roomId)}?code=${encodeURIComponent(code)}`, invite.origin));
+  if (!response.ok) throw new Error("Комната недоступна");
+  const info = await response.json();
   if (!info?.inviteCode || info.inviteCode !== code) throw new Error("Ссылка недействительна");
+  if (!info.online) throw new Error("Ведущий ещё не подключился");
   if (info.participantCount >= info.maxParticipants) throw new Error("В комнате уже 10 участников");
   pendingRoomInfo = info;
   $("#join-name").value = localStorage.getItem("code-with-me-name") || "";
@@ -1217,12 +1252,16 @@ async function exportLesson(mode) {
     await persistWorkspace();
     const name = `code-with-me-${mode === "template" ? "tasks" : "snapshot"}.cwmroom`;
     if (roomState.code) {
-      const link = document.createElement("a");
-      link.href = roomApiUrl("/api/export", { mode });
-      link.download = name;
-      document.body.append(link);
-      link.click();
-      link.remove();
+      if (roomState.transport instanceof GuestTransport) {
+        downloadText(await roomState.transport.request("/api/export", {}, { mode }), name);
+      } else {
+        const link = document.createElement("a");
+        link.href = roomApiUrl("/api/export", { mode });
+        link.download = name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+      }
     } else if (window.__TAURI__?.core?.invoke) {
       downloadText(await window.__TAURI__.core.invoke("export_room_archive", { mode }), name);
     } else {

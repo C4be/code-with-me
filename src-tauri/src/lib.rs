@@ -14,10 +14,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    io::Read,
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
@@ -25,24 +23,25 @@ use std::{
 };
 use tauri::{AppHandle, Manager, State as TauriState};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
-    process::{Child, Command},
-    sync::{broadcast, mpsc, oneshot, RwLock},
+    process::Command,
+    sync::{broadcast, oneshot, RwLock},
     time::timeout,
 };
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 const MAX_PARTICIPANTS: usize = 10;
+const RENDEZVOUS_BASE: &str = match option_env!("CODE_WITH_ME_RENDEZVOUS_BASE") {
+    Some(value) => value,
+    None => "https://code-with-me-app.ru",
+};
+const LEGACY_RENDEZVOUS_BASE: &str = "https://176-123-162-101.sslip.io";
 const RUN_TIMEOUT: Duration = Duration::from_secs(15);
 const ROOM_ARCHIVE_FORMAT: &str = "code-with-me-room";
 const ROOM_ARCHIVE_VERSION: u8 = 1;
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_ARCHIVE_JSON_BYTES: usize = 140 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 5000;
-const MAX_CLOUDFLARED_DOWNLOAD_BYTES: usize = 80 * 1024 * 1024;
-const CLOUDFLARED_RELEASE_API: &str =
-    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +55,8 @@ struct RoomInfo {
     participant_count: usize,
     max_participants: usize,
     participants: Vec<ParticipantView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_secret: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -82,6 +83,8 @@ struct Participant {
 
 struct RoomData {
     info: RoomInfo,
+    host_secret: String,
+    rendezvous_base: String,
     root: PathBuf,
     participants: RwLock<HashMap<String, Participant>>,
     events: broadcast::Sender<Value>,
@@ -90,7 +93,6 @@ struct RoomData {
 struct RunningRoom {
     data: Arc<RoomData>,
     stop: oneshot::Sender<()>,
-    tunnel: Child,
 }
 
 #[derive(Default)]
@@ -108,6 +110,8 @@ struct RoomQuery {
 struct FileQuery {
     code: String,
     path: String,
+    writer: Option<String>,
+    revision: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +148,7 @@ struct SocketQuery {
     code: String,
     name: Option<String>,
     host: Option<bool>,
+    host_secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -169,19 +174,6 @@ struct ArchiveFile {
     kind: String,
     encoding: String,
     content: String,
-}
-
-#[derive(Deserialize)]
-struct CloudflaredRelease {
-    tag_name: String,
-    assets: Vec<CloudflaredAsset>,
-}
-
-#[derive(Deserialize)]
-struct CloudflaredAsset {
-    name: String,
-    browser_download_url: String,
-    digest: Option<String>,
 }
 
 pub fn run() {
@@ -214,7 +206,9 @@ pub fn run() {
             open_local_room,
             create_contest,
             check_dependencies,
-            open_dependency_page,
+            install_dependency,
+            remove_managed_dependency,
+            ollama_complete,
             export_local_contest,
             delete_local_contest,
             run_local_file,
@@ -899,10 +893,13 @@ struct DependencyStatus {
     description: String,
     installed: bool,
     version: String,
+    path: String,
+    managed: bool,
 }
 
 #[tauri::command]
-fn check_dependencies() -> Vec<DependencyStatus> {
+fn check_dependencies(app: AppHandle) -> Vec<DependencyStatus> {
+    let managed = managed_dependencies(&app);
     let specs = [
         (
             "python",
@@ -918,11 +915,11 @@ fn check_dependencies() -> Vec<DependencyStatus> {
         (
             "cpp",
             "Компилятор C++",
-            "Нужен C++20; приложение ищет g++ в Windows и c++ в macOS/Linux",
+            "Нужен компилятор C++20",
             if cfg!(windows) {
-                vec!["g++"]
+                vec!["clang++", "g++"]
             } else {
-                vec!["c++", "g++", "clang++"]
+                vec!["clang++", "c++", "g++"]
             },
         ),
         (
@@ -932,10 +929,26 @@ fn check_dependencies() -> Vec<DependencyStatus> {
             vec!["javac"],
         ),
     ];
-    specs
+    let mut result: Vec<DependencyStatus> = specs
         .into_iter()
         .map(|(id, name, description, candidates)| {
-            let found = candidates.into_iter().find_map(find_executable);
+            let version_flag = if id == "go" {
+                "version"
+            } else if id == "java" {
+                "-version"
+            } else {
+                "--version"
+            };
+            let found = candidates
+                .into_iter()
+                .filter_map(find_executable)
+                .find(|path| {
+                    StdCommand::new(path)
+                        .arg(version_flag)
+                        .output()
+                        .map(|output| output.status.success())
+                        .unwrap_or(false)
+                });
             let checked = found
                 .as_ref()
                 .and_then(|path| {
@@ -973,14 +986,87 @@ fn check_dependencies() -> Vec<DependencyStatus> {
                 description: description.into(),
                 installed,
                 version: checked,
+                path: found
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                managed: managed.contains(&id.to_string()),
             }
         })
-        .collect()
+        .collect();
+    let ollama = find_executable("ollama");
+    let ollama_version = ollama
+        .as_ref()
+        .and_then(|path| StdCommand::new(path).arg("--version").output().ok())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    result.push(DependencyStatus {
+        id: "ollama".into(),
+        name: "Ollama".into(),
+        description: "Локальный движок дополнения кода".into(),
+        installed: ollama.is_some(),
+        version: ollama_version,
+        path: ollama
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        managed: managed.contains(&"ollama".to_string()),
+    });
+    let models_path = ollama_models_path();
+    let model_installed = ollama
+        .as_ref()
+        .and_then(|path| StdCommand::new(path).arg("list").output().ok())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("qwen2.5-coder:1.5b"))
+        })
+        .unwrap_or(false)
+        || models_path
+            .join("manifests/registry.ollama.ai/library/qwen2.5-coder/1.5b")
+            .is_file();
+    result.push(DependencyStatus {
+        id: "ollama-model".into(),
+        name: "Модель Qwen2.5 Coder 1.5B".into(),
+        description: "Локальные подсказки в редакторе · загрузка около 1 ГБ".into(),
+        installed: model_installed,
+        version: if model_installed {
+            "qwen2.5-coder:1.5b".into()
+        } else {
+            String::new()
+        },
+        path: models_path.display().to_string(),
+        managed: managed.contains(&"ollama-model".to_string()),
+    });
+    result
 }
 
 fn find_executable(command: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    {
+        if ["clang++", "clang", "c++"].contains(&command) {
+            directories.splice(
+                0..0,
+                ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin"].map(PathBuf::from),
+            );
+        }
+        if ["java", "javac"].contains(&command) {
+            directories.splice(
+                0..0,
+                [
+                    "/opt/homebrew/opt/openjdk/bin",
+                    "/usr/local/opt/openjdk/bin",
+                ]
+                .map(PathBuf::from),
+            );
+        }
+        directories.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    }
+    #[cfg(target_os = "linux")]
+    directories.extend(["/usr/bin", "/usr/local/bin"].map(PathBuf::from));
+    for directory in directories {
         let candidate = directory.join(command);
         if candidate.is_file() {
             return Some(candidate);
@@ -993,31 +1079,373 @@ fn find_executable(command: &str) -> Option<PathBuf> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    if command == "ollama" {
+        let path = PathBuf::from("/Applications/Ollama.app/Contents/Resources/ollama");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if command == "ollama" {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let path = PathBuf::from(local).join("Programs/Ollama/ollama.exe");
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
     None
 }
 
-#[tauri::command]
-fn open_dependency_page(id: String) -> Result<(), String> {
-    let url = match id.as_str() {
-        "python" => "https://www.python.org/downloads/",
-        "go" => "https://go.dev/dl/",
-        "cpp" if cfg!(target_os = "macos") => "https://developer.apple.com/xcode/resources/",
-        "cpp" if cfg!(target_os = "windows") => "https://www.msys2.org/",
-        "cpp" => "https://clang.llvm.org/get_started.html",
-        "java" => "https://adoptium.net/temurin/releases/",
-        _ => return Err("Неизвестная зависимость".into()),
-    };
-    #[cfg(target_os = "macos")]
-    let result = StdCommand::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let result = StdCommand::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+fn managed_file(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("managed-software.json"))
+        .map_err(|error| error.to_string())
+}
+
+fn managed_dependencies(app: &AppHandle) -> Vec<String> {
+    managed_file(app)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_managed(app: &AppHandle, ids: &[String]) -> Result<(), String> {
+    let path = managed_file(app)?;
+    std::fs::create_dir_all(path.parent().ok_or("Недопустимый путь")?)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(
+        path,
+        serde_json::to_vec(ids).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn ollama_models_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("OLLAMA_MODELS") {
+        return PathBuf::from(path);
+    }
     #[cfg(target_os = "linux")]
-    let result = StdCommand::new("xdg-open").arg(url).spawn();
-    result
-        .map(|_| ())
-        .map_err(|error| format!("Не удалось открыть страницу установки: {error}"))
+    {
+        let system = PathBuf::from("/usr/share/ollama/.ollama/models");
+        if system.exists() {
+            return system;
+        }
+    }
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    PathBuf::from(home).join(".ollama/models")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_package_manager() -> Result<String, String> {
+    ["apt-get", "dnf", "pacman"]
+        .into_iter()
+        .find(|name| find_executable(name).is_some())
+        .map(str::to_string)
+        .ok_or("Нужен apt, dnf или pacman для установки инструментов".into())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_package_name<'a>(id: &'a str, manager: &str) -> Result<&'a str, String> {
+    match (manager, id) {
+        ("apt-get", "go") => Ok("golang-go"),
+        ("apt-get", "cpp") => Ok("g++"),
+        ("apt-get", "java") => Ok("default-jdk"),
+        ("dnf", "go") => Ok("golang"),
+        ("dnf", "cpp") => Ok("gcc-c++"),
+        ("dnf", "java") => Ok("java-21-openjdk-devel"),
+        ("pacman", "go") => Ok("go"),
+        ("pacman", "cpp") => Ok("gcc"),
+        ("pacman", "java") => Ok("jdk-openjdk"),
+        ("pacman", "python") => Ok("python"),
+        (_, "python") => Ok("python3"),
+        _ => Err("Для этого дистрибутива пакет не найден".into()),
+    }
+}
+
+async fn ensure_ollama_server(path: &Path) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| error.to_string())?;
+    if client
+        .get("http://127.0.0.1:11434/api/tags")
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    Command::new(path)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Не удалось запустить Ollama: {error}"))?;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        if client
+            .get("http://127.0.0.1:11434/api/tags")
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err("Сервер Ollama не запустился. Проверьте его установку.".into())
+}
+
+fn package_name(id: &str) -> Result<&'static str, String> {
+    #[cfg(target_os = "macos")]
+    let packages = [
+        ("python", "python"),
+        ("go", "go"),
+        ("cpp", "llvm"),
+        ("java", "openjdk"),
+        ("ollama", "ollama"),
+    ];
+    #[cfg(target_os = "windows")]
+    let packages = [
+        ("python", "Python.Python.3.13"),
+        ("go", "GoLang.Go"),
+        ("cpp", "LLVM.LLVM"),
+        ("java", "EclipseAdoptium.Temurin.21.JDK"),
+        ("ollama", "Ollama.Ollama"),
+    ];
+    #[cfg(target_os = "linux")]
+    let packages = [
+        ("python", "python3"),
+        ("go", "golang-go"),
+        ("cpp", "g++"),
+        ("java", "default-jdk"),
+        ("ollama", "ollama"),
+    ];
+    packages
+        .into_iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, value)| value)
+        .ok_or("Неизвестный инструмент".into())
+}
+
+#[tauri::command]
+async fn install_dependency(app: AppHandle, id: String) -> Result<String, String> {
+    if id == "ollama-model" {
+        let ollama = find_executable("ollama").ok_or("Сначала установите Ollama")?;
+        ensure_ollama_server(&ollama).await?;
+        let output = Command::new(ollama)
+            .args(["pull", "qwen2.5-coder:1.5b"])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    } else {
+        let package = package_name(&id)?;
+        #[cfg(target_os = "linux")]
+        if id == "ollama" {
+            let response = reqwest::get("https://ollama.com/install.sh")
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("Не удалось скачать Ollama: {}", response.status()));
+            }
+            let script = response.bytes().await.map_err(|error| error.to_string())?;
+            if script.len() > 1024 * 1024 {
+                return Err("Установщик Ollama неожиданно велик".into());
+            }
+            let path = std::env::temp_dir().join(format!(
+                "code-with-me-ollama-{}.sh",
+                Uuid::new_v4().simple()
+            ));
+            tokio::fs::write(&path, script)
+                .await
+                .map_err(|error| error.to_string())?;
+            let result = Command::new("pkexec")
+                .arg("sh")
+                .arg(&path)
+                .output()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tokio::fs::remove_file(&path).await;
+            let output = result?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            let mut managed = managed_dependencies(&app);
+            if !managed.contains(&id) {
+                managed.push(id);
+                save_managed(&app, &managed)?;
+            }
+            return Ok("Ollama установлена".into());
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let brew = find_executable("brew")
+                .ok_or("Для автоматической установки на macOS нужен Homebrew")?;
+            let mut command = Command::new(brew);
+            command.args(["install", package]);
+            command
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("winget");
+            command.args([
+                "install",
+                "--id",
+                package,
+                "--exact",
+                "--source",
+                "winget",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ]);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let manager = linux_package_manager()?;
+            let package = linux_package_name(&id, &manager)?;
+            let mut command = Command::new("pkexec");
+            if manager == "pacman" {
+                command.args([manager.as_str(), "-S", "--noconfirm", package]);
+            } else {
+                command.args([manager.as_str(), "install", "-y", package]);
+            }
+            command
+        };
+        let output = command
+            .output()
+            .await
+            .map_err(|error| format!("Не удалось запустить установку: {error}"))?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Установка не завершилась: {}",
+                details.lines().last().unwrap_or("неизвестная ошибка")
+            ));
+        }
+    }
+    let mut managed = managed_dependencies(&app);
+    if !managed.contains(&id) {
+        managed.push(id.clone());
+        save_managed(&app, &managed)?;
+    }
+    Ok(
+        "Установка завершена. Если инструмент не появился в списке, перезапустите приложение."
+            .into(),
+    )
+}
+
+#[tauri::command]
+async fn remove_managed_dependency(app: AppHandle, id: String) -> Result<(), String> {
+    let mut managed = managed_dependencies(&app);
+    if !managed.contains(&id) {
+        return Err("Этот инструмент установлен вне приложения; его файлы не будут удалены".into());
+    }
+    if id == "ollama" && managed.contains(&"ollama-model".to_string()) {
+        return Err("Сначала очистите модель Ollama в настройках".into());
+    }
+    if id == "ollama-model" {
+        let ollama = find_executable("ollama").ok_or("Ollama не найдена")?;
+        ensure_ollama_server(&ollama).await?;
+        let output = Command::new(ollama)
+            .args(["rm", "qwen2.5-coder:1.5b"])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    } else {
+        let package = package_name(&id)?;
+        #[cfg(target_os = "linux")]
+        if id == "ollama" {
+            let mut script = String::from("systemctl stop ollama 2>/dev/null || true\nsystemctl disable ollama 2>/dev/null || true\n");
+            script.push_str("rm -f /etc/systemd/system/ollama.service /usr/local/bin/ollama /usr/bin/ollama\nrm -rf /usr/local/lib/ollama /usr/lib/ollama\nsystemctl daemon-reload 2>/dev/null || true\n");
+            let output = Command::new("pkexec")
+                .args(["sh", "-c", &script])
+                .output()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            managed.retain(|item| item != &id);
+            return save_managed(&app, &managed);
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let brew = find_executable("brew").ok_or("Homebrew не найден")?;
+            let mut command = Command::new(brew);
+            command.args(["uninstall", package]);
+            command
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("winget");
+            command.args([
+                "uninstall",
+                "--id",
+                package,
+                "--exact",
+                "--source",
+                "winget",
+            ]);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let manager = linux_package_manager()?;
+            let package = linux_package_name(&id, &manager)?;
+            let mut command = Command::new("pkexec");
+            if manager == "pacman" {
+                command.args([manager.as_str(), "-R", "--noconfirm", package]);
+            } else {
+                command.args([manager.as_str(), "remove", "-y", package]);
+            }
+            command
+        };
+        let output = command.output().await.map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    }
+    managed.retain(|item| item != &id);
+    save_managed(&app, &managed)
+}
+
+#[tauri::command]
+async fn ollama_complete(
+    prefix: String,
+    suffix: String,
+    language: String,
+) -> Result<String, String> {
+    let ollama = find_executable("ollama").ok_or("Ollama не установлена")?;
+    ensure_ollama_server(&ollama).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(35))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client.post("http://127.0.0.1:11434/api/generate")
+        .json(&json!({"model":"qwen2.5-coder:1.5b", "system": format!("Продолжи код на {language}. Верни только продолжение без пояснений."), "prompt": prefix.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>(), "suffix": suffix.chars().take(2000).collect::<String>(), "stream": false, "options": {"temperature": 0.1, "num_predict": 96}}))
+        .send().await.map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama ответила: {}", response.status()));
+    }
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    Ok(body
+        .get("response")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 #[tauri::command]
@@ -1069,10 +1497,7 @@ fn create_contest(
 }
 
 #[tauri::command]
-async fn start_room(
-    app: AppHandle,
-    manager: TauriState<'_, RoomManager>,
-) -> Result<RoomInfo, String> {
+async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, String> {
     let already_running = {
         manager
             .running
@@ -1082,7 +1507,7 @@ async fn start_room(
             .map(|existing| existing.data.clone())
     };
     if let Some(existing) = already_running {
-        return Ok(room_info(&existing).await);
+        return Ok(host_room_info(&existing).await);
     }
     let root = manager
         .root
@@ -1090,7 +1515,6 @@ async fn start_room(
         .map_err(|_| "Папка проекта недоступна")?
         .clone()
         .ok_or_else(|| "Папка проекта ещё не настроена".to_string())?;
-    let cloudflared = ensure_cloudflared(&app).await?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("Не удалось запустить комнату: {error}"))?;
@@ -1098,13 +1522,9 @@ async fn start_room(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let (public_base, tunnel) = start_public_tunnel(&cloudflared, port).await?;
-    let address = public_base
-        .strip_prefix("https://")
-        .unwrap_or(&public_base)
-        .to_string();
     let invite_code = Uuid::new_v4().simple().to_string();
     let room_id = Uuid::new_v4().to_string();
+    let host_secret = Uuid::new_v4().simple().to_string();
     let host_id = Uuid::new_v4().to_string();
     let (events, _) = broadcast::channel(256);
     let mut participants = HashMap::new();
@@ -1115,7 +1535,36 @@ async fn start_room(
             host: true,
         },
     );
-    let url = format!("{public_base}/?code={invite_code}");
+    let client = reqwest::Client::new();
+    let mut registered = None;
+    let mut last_error = String::new();
+    let bases = if RENDEZVOUS_BASE == "https://code-with-me-app.ru" {
+        vec![RENDEZVOUS_BASE, LEGACY_RENDEZVOUS_BASE]
+    } else {
+        vec![RENDEZVOUS_BASE]
+    };
+    for base in bases {
+        let url = format!("{base}/?room={room_id}&code={invite_code}");
+        let response = client
+            .post(format!("{base}/api/rooms"))
+            .timeout(Duration::from_secs(6))
+            .json(&json!({"roomId":room_id,"inviteCode":invite_code,"hostSecret":host_secret,"inviteURL":url}))
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                registered = Some((base.to_string(), url));
+                break;
+            }
+            Ok(response) => last_error = format!("Сервер комнат вернул {}", response.status()),
+            Err(error) => last_error = format!("Сервер комнат недоступен: {error}"),
+        }
+    }
+    let (rendezvous_base, url) = registered.ok_or(last_error)?;
+    let address = rendezvous_base
+        .strip_prefix("https://")
+        .unwrap_or(&rendezvous_base)
+        .to_string();
     let info = RoomInfo {
         room_id,
         invite_code: invite_code.clone(),
@@ -1130,9 +1579,12 @@ async fn start_room(
             name: "Хозяин комнаты".into(),
             host: true,
         }],
+        host_secret: None,
     };
     let data = Arc::new(RoomData {
         info,
+        host_secret,
+        rendezvous_base,
         root,
         participants: RwLock::new(participants),
         events,
@@ -1149,13 +1601,12 @@ async fn start_room(
     let room = RunningRoom {
         data: data.clone(),
         stop,
-        tunnel,
     };
     *manager
         .running
         .lock()
         .map_err(|_| "Состояние комнаты недоступно")? = Some(room);
-    Ok(room_info(&data).await)
+    Ok(host_room_info(&data).await)
 }
 
 #[tauri::command]
@@ -1167,9 +1618,17 @@ async fn stop_room(manager: TauriState<'_, RoomManager>) -> Result<(), String> {
             .map_err(|_| "Состояние комнаты недоступно")?;
         running.take()
     };
-    if let Some(mut room) = room {
+    if let Some(room) = room {
         let _ = room.stop.send(());
-        let _ = room.tunnel.kill().await;
+        let _ = reqwest::Client::new()
+            .delete(format!(
+                "{}/api/rooms/{}",
+                room.data.rendezvous_base, room.data.info.room_id
+            ))
+            .header("X-Host-Secret", &room.data.host_secret)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
     }
     Ok(())
 }
@@ -1183,7 +1642,7 @@ async fn current_room(manager: TauriState<'_, RoomManager>) -> Result<Option<Roo
         .as_ref()
         .map(|room| room.data.clone());
     match room {
-        Some(data) => Ok(Some(room_info(&data).await)),
+        Some(data) => Ok(Some(host_room_info(&data).await)),
         None => Ok(None),
     }
 }
@@ -1205,387 +1664,10 @@ async fn room_info(room: &RoomData) -> RoomInfo {
     info
 }
 
-async fn ensure_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
-    let (asset_name, archive) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "x86_64") => ("cloudflared-darwin-amd64.tgz", true),
-        ("macos", "aarch64") => ("cloudflared-darwin-arm64.tgz", true),
-        ("linux", "x86_64") => ("cloudflared-linux-amd64", false),
-        ("linux", "aarch64") => ("cloudflared-linux-arm64", false),
-        ("windows", "x86_64") => ("cloudflared-windows-amd64.exe", false),
-        (os, arch) => {
-            return Err(format!(
-                "Публичные комнаты пока не поддерживаются на этой архитектуре ({os}/{arch})"
-            ));
-        }
-    };
-    let binary_name = if std::env::consts::OS == "windows" {
-        "cloudflared.exe"
-    } else {
-        "cloudflared"
-    };
-    let tool_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Не удалось найти папку данных приложения: {error}"))?
-        .join("tools")
-        .join(format!(
-            "cloudflared-{}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ));
-    std::fs::create_dir_all(&tool_dir)
-        .map_err(|error| format!("Не удалось подготовить публичный доступ: {error}"))?;
-    let installed_binary = tool_dir.join(binary_name);
-    let cached_binary = std::fs::metadata(&installed_binary)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 1_000_000);
-    let cached_version = std::fs::read_to_string(tool_dir.join("version")).unwrap_or_default();
-
-    let client = reqwest::Client::builder()
-        .user_agent("Code-with-me-desktop")
-        .timeout(Duration::from_secs(45))
-        .build()
-        .map_err(|error| format!("Не удалось подготовить загрузчик туннеля: {error}"))?;
-    let release_response = client
-        .get(CLOUDFLARED_RELEASE_API)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| error.to_string());
-    let release_response = match release_response {
-        Ok(response) => response,
-        Err(_) if cached_binary => return Ok(installed_binary),
-        Err(error) => {
-            return Err(format!(
-                "Для публичной комнаты нужно загрузить сетевой компонент. Проверьте подключение к интернету и повторите попытку: {error}"
-            ));
-        }
-    };
-    let release: CloudflaredRelease = match release_response.json().await {
-        Ok(release) => release,
-        Err(_) if cached_binary => return Ok(installed_binary),
-        Err(error) => {
-            return Err(format!(
-                "Не удалось прочитать выпуск сетевого компонента: {error}"
-            ));
-        }
-    };
-    let release_tag = release.tag_name;
-    if release_tag.is_empty()
-        || !release_tag
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
-    {
-        return Err("Получено некорректное имя выпуска сетевого компонента".into());
-    }
-    if cached_binary && cached_version.trim() == release_tag {
-        return Ok(installed_binary);
-    }
-    let asset = release
-        .assets
-        .into_iter()
-        .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| format!("В выпуске cloudflared нет файла {asset_name}"))?;
-    if !asset
-        .browser_download_url
-        .starts_with("https://github.com/cloudflare/cloudflared/releases/download/")
-    {
-        return Err("Источник сетевого компонента не прошёл проверку".into());
-    }
-    let expected_digest = asset
-        .digest
-        .as_deref()
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| "Выпуск cloudflared не содержит контрольную сумму SHA-256".to_string())?;
-    let response = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| format!("Не удалось загрузить сетевой компонент: {error}"))?;
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_CLOUDFLARED_DOWNLOAD_BYTES as u64)
-    {
-        return Err("Файл сетевого компонента превышает допустимый размер".into());
-    }
-    let package = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Не удалось получить сетевой компонент: {error}"))?;
-    if package.len() > MAX_CLOUDFLARED_DOWNLOAD_BYTES {
-        return Err("Файл сетевого компонента превышает допустимый размер".into());
-    }
-    let actual_digest = format!("{:x}", Sha256::digest(&package));
-    if !actual_digest.eq_ignore_ascii_case(expected_digest) {
-        return Err("Контрольная сумма сетевого компонента не совпала".into());
-    }
-    let binary = if archive {
-        extract_cloudflared_binary(&package)?
-    } else {
-        package.to_vec()
-    };
-    if binary.len() < 1_000_000 {
-        return Err("Загруженный сетевой компонент выглядит повреждённым".into());
-    }
-    let pending = tool_dir.join(format!("{binary_name}.download"));
-    std::fs::write(&pending, binary)
-        .map_err(|error| format!("Не удалось сохранить сетевой компонент: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("Не удалось разрешить запуск сетевого компонента: {error}"))?;
-    }
-    if installed_binary.exists() {
-        std::fs::remove_file(&installed_binary)
-            .map_err(|error| format!("Не удалось обновить сетевой компонент: {error}"))?;
-    }
-    std::fs::rename(&pending, &installed_binary)
-        .map_err(|error| format!("Не удалось установить сетевой компонент: {error}"))?;
-    std::fs::write(tool_dir.join("version"), release_tag)
-        .map_err(|error| format!("Не удалось сохранить версию сетевого компонента: {error}"))?;
-    Ok(installed_binary)
-}
-
-fn extract_cloudflared_binary(package: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder = flate2::read::GzDecoder::new(package);
-    let mut expanded = Vec::new();
-    decoder
-        .take(MAX_CLOUDFLARED_DOWNLOAD_BYTES as u64)
-        .read_to_end(&mut expanded)
-        .map_err(|error| format!("Не удалось распаковать сетевой компонент: {error}"))?;
-    if expanded.len() >= MAX_CLOUDFLARED_DOWNLOAD_BYTES {
-        return Err("Распакованный сетевой компонент превышает допустимый размер".into());
-    }
-    let mut offset = 0;
-    while offset + 512 <= expanded.len() {
-        let header = &expanded[offset..offset + 512];
-        if header.iter().all(|byte| *byte == 0) {
-            break;
-        }
-        let name = std::str::from_utf8(&header[..100])
-            .unwrap_or("")
-            .trim_matches('\0');
-        let prefix = std::str::from_utf8(&header[345..500])
-            .unwrap_or("")
-            .trim_matches('\0');
-        let relative = if prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let size_field = std::str::from_utf8(&header[124..136])
-            .unwrap_or("")
-            .trim_matches('\0')
-            .trim();
-        let size = usize::from_str_radix(size_field, 8)
-            .map_err(|_| "Архив сетевого компонента повреждён".to_string())?;
-        let payload_start = offset + 512;
-        let payload_end = payload_start.saturating_add(size);
-        if payload_end > expanded.len() {
-            return Err("Архив сетевого компонента обрезан".into());
-        }
-        if Path::new(&relative)
-            .file_name()
-            .and_then(|value| value.to_str())
-            == Some("cloudflared")
-            && matches!(header[156], 0 | b'0')
-        {
-            return Ok(expanded[payload_start..payload_end].to_vec());
-        }
-        offset = payload_start + size.div_ceil(512) * 512;
-    }
-    Err("В архиве не найден исполняемый файл cloudflared".into())
-}
-
-async fn forward_tunnel_output<R>(stream: R, sender: mpsc::UnboundedSender<String>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let shortened: String = line.chars().take(2000).collect();
-        // Keep draining cloudflared's pipes after the invite URL has been
-        // captured. Closing them can make the tunnel process exit or block.
-        let _ = sender.send(shortened);
-    }
-}
-
-fn append_tunnel_log(log_lines: &mut Vec<String>, line: String) {
-    const MAX_TUNNEL_LOG_LINES: usize = 32;
-    if log_lines.len() == MAX_TUNNEL_LOG_LINES {
-        log_lines.remove(0);
-    }
-    log_lines.push(line);
-}
-
-fn tunnel_precheck_hint(log_lines: &[String]) -> Option<&'static str> {
-    let failed_checks: Vec<_> = log_lines
-        .iter()
-        .filter(|line| line.contains("precheck component=") && line.contains("status=fail"))
-        .collect();
-
-    if failed_checks
-        .iter()
-        .any(|line| line.contains("DNS Resolution"))
-    {
-        return Some(
-            "Не удалось разрешить адреса Cloudflare. Проверьте настройки DNS и подключение VPN или прокси.",
-        );
-    }
-
-    let udp_failed = failed_checks
-        .iter()
-        .any(|line| line.contains("UDP Connectivity"));
-    let tcp_failed = failed_checks
-        .iter()
-        .any(|line| line.contains("TCP Connectivity"));
-    if udp_failed && tcp_failed {
-        return Some(
-            "Сеть не пропускает соединение к Cloudflare через UDP или TCP на порту 7844. Проверьте настройки сети или брандмауэра.",
-        );
-    }
-
-    log_lines
-        .iter()
-        .any(|line| line.contains("precheck complete hard_fail=true"))
-        .then_some(
-            "Проверка соединения с Cloudflare не пройдена. Проверьте DNS, VPN или прокси и доступ к Интернету.",
-        )
-}
-
-fn tunnel_url_from_log(line: &str) -> Option<String> {
-    let start = line.find("https://")?;
-    let candidate = line[start..]
-        .split_whitespace()
-        .next()?
-        .trim_end_matches(['.', ',', ')', ']', '}', '"', '\'']);
-    let host = candidate.strip_prefix("https://")?.split('/').next()?;
-    (host.ends_with(".trycloudflare.com") && host.len() > ".trycloudflare.com".len())
-        .then(|| format!("https://{host}"))
-}
-
-async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Child), String> {
-    let origin = format!("http://127.0.0.1:{port}");
-    let mut command = Command::new(executable);
-    command
-        .arg("tunnel")
-        .arg("--no-autoupdate")
-        .arg("--protocol")
-        .arg("auto")
-        .arg("--url")
-        .arg(origin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.as_std_mut().creation_flags(0x08000000);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Не удалось запустить публичный туннель: {error}"))?;
-    let (sender, mut output) = mpsc::unbounded_channel();
-    if let Some(stdout) = child.stdout.take() {
-        tauri::async_runtime::spawn(forward_tunnel_output(stdout, sender.clone()));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        tauri::async_runtime::spawn(forward_tunnel_output(stderr, sender.clone()));
-    }
-    drop(sender);
-
-    let mut log_lines = Vec::new();
-    let mut precheck_lines = Vec::new();
-    let mut public_url = None;
-    let mut connection_registered = false;
-    let tunnel = timeout(Duration::from_secs(90), async {
-        loop {
-            tokio::select! {
-                line = output.recv() => match line {
-                    Some(line) => {
-                        if let Some(url) = tunnel_url_from_log(&line) {
-                            public_url = Some(url);
-                        }
-                        if line.contains("Registered tunnel connection") {
-                            connection_registered = true;
-                        }
-                        if connection_registered {
-                            if let Some(url) = public_url.take() {
-                                return Ok(url);
-                            }
-                        }
-                        if line.contains("precheck component=")
-                            || line.contains("precheck complete")
-                        {
-                            append_tunnel_log(&mut precheck_lines, line.clone());
-                        }
-                        append_tunnel_log(&mut log_lines, line);
-                    }
-                    None => return Err("Публичный туннель закрыл журнал запуска".to_string()),
-                },
-                status = child.wait() => {
-                    let detail = status
-                        .map(|status| format!("Код завершения: {status}"))
-                        .unwrap_or_else(|error| error.to_string());
-                    // stdout and stderr readers can still have buffered lines after the
-                    // process exits. Drain them before building the diagnostic message.
-                    let _ = timeout(Duration::from_secs(2), async {
-                        while let Some(line) = output.recv().await {
-                            if line.contains("precheck component=")
-                                || line.contains("precheck complete")
-                            {
-                                append_tunnel_log(&mut precheck_lines, line.clone());
-                            }
-                            append_tunnel_log(&mut log_lines, line);
-                        }
-                    }).await;
-                    let hint = tunnel_precheck_hint(&precheck_lines);
-                    let details = log_lines.join(" ");
-                    let message = if let Some(hint) = hint {
-                        format!("{hint} {detail}. {details}")
-                    } else if details.is_empty() {
-                        format!("Публичный туннель завершился до создания ссылки. {detail}")
-                    } else {
-                        format!("Публичный туннель завершился до создания ссылки. {detail}. {details}")
-                    };
-                    return Err(message);
-                }
-            }
-        }
-    })
-    .await;
-    let public_base = match tunnel {
-        Ok(Ok(url)) => url,
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
-            let details = log_lines.join(" ");
-            return Err(if details.is_empty() {
-                error
-            } else {
-                format!("{error}. {details}")
-            });
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let details = log_lines.join(" ");
-            return Err(if details.is_empty() {
-                "Публичный туннель не подключился к Cloudflare за 90 секунд. Проверьте соединение и повторите попытку".into()
-            } else {
-                format!("Публичный туннель не подключился к Cloudflare за 90 секунд. {details}")
-            });
-        }
-    };
-    if child
-        .try_wait()
-        .map_err(|error| format!("Не удалось проверить состояние туннеля: {error}"))?
-        .is_some()
-    {
-        return Err("Публичный туннель завершился сразу после запуска".into());
-    }
-    Ok((public_base, child))
+async fn host_room_info(room: &RoomData) -> RoomInfo {
+    let mut info = room_info(room).await;
+    info.host_secret = Some(room.host_secret.clone());
+    info
 }
 
 fn room_router(room: Arc<RoomData>) -> Router {
@@ -1654,7 +1736,9 @@ async fn get_room(State(room): State<Arc<RoomData>>, Query(query): Query<RoomQue
     if query.code != room.info.invite_code {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(room_info(&room).await).into_response()
+    let mut info = room_info(&room).await;
+    info.local_base = None;
+    Json(info).into_response()
 }
 
 async fn export_room(
@@ -1820,7 +1904,7 @@ async fn write_file(
     }
     let _ = room
         .events
-        .send(json!({"type":"file:saved", "path":query.path, "content":body}));
+        .send(json!({"type":"file:saved", "path":query.path, "content":body, "writer":query.writer, "revision":query.revision}));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1967,13 +2051,26 @@ async fn execute_isolated_file(root: &Path, path: &Path) -> Result<RunResult, St
     match ext.as_str() {
         "py" => {
             execute(
-                Command::new(if cfg!(windows) { "python" } else { "python3" })
+                Command::new(
+                    find_executable(if cfg!(windows) { "python" } else { "python3" })
+                        .unwrap_or_else(|| {
+                            PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+                        }),
+                )
+                .arg(path)
+                .current_dir(root),
+            )
+            .await
+        }
+        "go" => {
+            execute(
+                Command::new(find_executable("go").unwrap_or_else(|| PathBuf::from("go")))
+                    .arg("run")
                     .arg(path)
                     .current_dir(root),
             )
             .await
         }
-        "go" => execute(Command::new("go").arg("run").arg(path).current_dir(root)).await,
         "cpp" | "cc" | "cxx" => compile_and_run_cpp(root, path).await,
         "java" => compile_and_run_java(root, path).await,
         _ => Err("Поддерживаются Python, Go, C++ и Java".into()),
@@ -2014,7 +2111,17 @@ async fn compile_and_run_cpp(root: &Path, source: &Path) -> Result<RunResult, St
     } else {
         "solution"
     });
-    let compiler = if cfg!(windows) { "g++" } else { "c++" };
+    let compiler = ["clang++", "c++", "g++"]
+        .into_iter()
+        .filter_map(find_executable)
+        .find(|path| {
+            StdCommand::new(path)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+        .ok_or("Компилятор C++ не найден")?;
     let compile = execute(
         Command::new(compiler)
             .arg("-std=c++20")
@@ -2067,7 +2174,7 @@ async fn compile_and_run_java(root: &Path, source: &Path) -> Result<RunResult, S
             .map_err(|error| error.to_string())?;
     }
     let compile = execute(
-        Command::new("javac")
+        Command::new(find_executable("javac").unwrap_or_else(|| PathBuf::from("javac")))
             .arg("-d")
             .arg(&build)
             .arg(&compile_source)
@@ -2078,7 +2185,7 @@ async fn compile_and_run_java(root: &Path, source: &Path) -> Result<RunResult, S
         return Ok(compile);
     }
     execute(
-        Command::new("java")
+        Command::new(find_executable("java").unwrap_or_else(|| PathBuf::from("java")))
             .arg("-cp")
             .arg(build)
             .arg(class_name)
@@ -2100,6 +2207,9 @@ async fn websocket(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Гость".into());
     let is_host = query.host.unwrap_or(false);
+    if is_host && query.host_secret.as_deref() != Some(room.host_secret.as_str()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let id = if is_host {
         let participants = room.participants.read().await;
         match participants
@@ -2144,7 +2254,11 @@ async fn handle_socket(
         }
     }
     let (mut sender, mut receiver) = socket.split();
-    let ready = json!({"type":"room:ready", "id":id, "name":name, "room":room_info(&room).await});
+    let mut visible_room = room_info(&room).await;
+    if !is_host {
+        visible_room.local_base = None;
+    }
+    let ready = json!({"type":"room:ready", "id":id, "name":name, "room":visible_room});
     if sender
         .send(Message::Text(ready.to_string().into()))
         .await
@@ -2161,6 +2275,15 @@ async fn handle_socket(
                     let Ok(mut event) = serde_json::from_str::<Value>(&text) else { continue; };
                     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
                     if kind == "presence" {
+                        if let Some(object) = event.as_object_mut() { object.insert("participantId".into(), json!(id)); }
+                        let _ = room.events.send(event);
+                    } else if kind == "code:change" {
+                        let path = event.get("path").and_then(Value::as_str).unwrap_or("");
+                        let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+                        let revision = event.get("revision").and_then(Value::as_u64).unwrap_or(0);
+                        if path.len() > 200 || content.len() > 1024 * 1024 || revision == 0 { continue; }
+                        let Ok(target) = safe_path(&room.root, path) else { continue; };
+                        if !is_code_file(&target) { continue; }
                         if let Some(object) = event.as_object_mut() { object.insert("participantId".into(), json!(id)); }
                         let _ = room.events.send(event);
                     } else if kind == "rename" {

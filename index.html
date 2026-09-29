@@ -35,7 +35,7 @@
           <span class="room-state room-idle" id="room-state"><i></i><span>Локальная комната</span></span>
           <div class="participants" id="participants" aria-label="Участники комнаты"><span class="people-count">0 / 10</span></div>
           <button class="button secondary" id="lesson-button">Сохранить занятие</button>
-          <button class="button secondary" id="invite-button" disabled>Пригласить</button>
+          <button class="button secondary hidden" id="invite-button" disabled>Пригласить</button>
           <button class="button secondary" id="start-room-button">Создать комнату</button>
           <button class="button secondary hidden" id="stop-room-button">Остановить</button>
           <button class="button secondary hidden" id="close-contest-button">Закрыть контест</button>
@@ -44,10 +44,11 @@
       </header>
 
       <main class="home-view hidden" id="home-view">
-        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-connect-button">Подключиться по ссылке</button><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
+        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-settings-button">Настройки</button><button class="button secondary" id="home-connect-button">Подключиться по ссылке</button><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Мои контесты</h2><span>Созданные на этом компьютере</span></div><div class="contest-list" id="my-contest-list" aria-label="Мои контесты"></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Сохранённые и импортированные</h2><span>Снимки занятий и загруженные контесты</span></div><div class="contest-list" id="saved-contest-list" aria-label="Сохранённые контесты"></div></section>
-        <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Компиляторы и интерпретаторы, необходимые для запуска решений на этом компьютере</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные языки…</p></div></section>
+        <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Языки программирования и локальное дополнение кода</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные инструменты…</p></div></section>
+        <section class="home-section software-section" id="software-section"><div class="home-section-heading"><div><h2>Настройки · Софт</h2><span>Расположение инструментов и очистка установленных через приложение компонентов</span></div></div><div class="dependency-list" id="software-list"></div></section>
         <input id="home-file-input" type="file" accept=".cwmroom,application/json" hidden />
       </main>
 
@@ -75,7 +76,9 @@
               <label><span>Сложность</span><select id="task-field-difficulty"><option value="easy">Лёгкая</option><option value="medium">Средняя</option><option value="hard">Сложная</option></select></label>
               <label><span>Минуты</span><input id="task-field-time" type="number" min="1" max="600" /></label>
               <label><span>Язык решений</span><select id="task-field-language"><option value="python">Python</option><option value="go">Go</option><option value="cpp">C++</option><option value="java">Java</option></select></label>
-              <label class="wide body-field"><span>Текст задания · Markdown</span><textarea id="task-field-body" spellcheck="true"></textarea></label>
+              <label class="wide body-field"><span>Описание задачи</span><textarea id="task-field-body" spellcheck="true" placeholder="Опишите, что нужно сделать. Markdown здесь не нужен."></textarea></label>
+              <div class="wide examples-heading"><div><strong>Примеры</strong><small>Укажите входные данные и ожидаемый результат</small></div><button class="button secondary" id="add-example-button" type="button">＋ Добавить пример</button></div>
+              <div class="wide task-examples-form" id="task-examples-form"></div>
             </form>
           </div>
 
@@ -118,14 +121,14 @@
               <pre aria-hidden="true"><code id="highlight-code"></code></pre>
               <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Редактор кода" wrap="off"></textarea>
               <div class="remote-cursors" id="remote-cursors" aria-hidden="true"></div>
-              <div class="suggestion hidden" id="suggestion"><strong id="suggestion-word"></strong><kbd>Tab</kbd></div>
+              <div class="suggestion hidden" id="suggestion"><span id="suggestion-kind">Подсказка</span><strong id="suggestion-word"></strong><kbd>Tab</kbd></div>
             </div>
           </div>
           <div class="output-panel" id="output-panel">
             <div class="output-header"><strong>ТЕРМИНАЛ</strong><span id="run-result">ГОТОВО</span><small class="local-run-note">Запуск на вашем устройстве · вывод виден только вам</small><button id="clear-output" aria-label="Очистить вывод">Очистить</button></div>
             <pre id="output-text">Нажмите «Запустить», чтобы выполнить текущее решение.</pre>
           </div>
-          <footer class="statusbar"><span>● Синхронизировано</span><span id="cursor-position">Строка 1, столбец 1</span><span id="status-language">Python</span></footer>
+          <footer class="statusbar"><span id="sync-state">● Локально</span><span id="cursor-position">Строка 1, столбец 1</span><span id="status-language">Python</span></footer>
         </section>
       </main>
 
@@ -165,6 +168,17 @@
             <button class="button secondary" id="local-copy-button">Создать локальную копию</button>
             <input id="room-file-input" type="file" accept=".cwmroom,application/json" hidden />
             <p>Локальная комната работает без сервера и подключений.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="disconnected-modal" role="dialog" aria-modal="true" aria-labelledby="disconnected-title">
+        <div class="modal-card disconnected-card">
+          <div class="modal-header"><div><span>СОЕДИНЕНИЕ ЗАВЕРШЕНО</span><h2 id="disconnected-title">Связь с ведущим прервана</h2></div></div>
+          <p>Изменения больше не синхронизируются. Код и задания пока доступны только в этом окне. Сохраните контест, чтобы не потерять их при выходе.</p>
+          <div class="disconnected-actions">
+            <button class="button primary" id="save-disconnected-button">Сохранить контест</button>
+            <button class="button secondary" id="leave-disconnected-button">Выйти без сохранения</button>
           </div>
         </div>
       </div>

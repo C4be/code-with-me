@@ -84,6 +84,7 @@ button { border: 0; cursor: pointer; }
 .home-view { flex: 1; min-height: 0; overflow-y: auto; padding: 34px clamp(24px, 7vw, 110px); }
 .home-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin: 8px 0 24px; }
 .home-actions { display: flex; align-items: center; gap: 8px; }
+.home-actions { flex-wrap: wrap; justify-content: flex-end; }
 .home-heading>div>span { color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: 1.2px; }
 .home-heading h1 { margin: 7px 0; font-size: 30px; letter-spacing: -1px; }
 .home-heading p { margin: 0; color: var(--muted); font-size: 11px; }
@@ -133,13 +134,32 @@ button { border: 0; cursor: pointer; }
 
 .task-form { min-height: 100%; display: grid; grid-template-columns: 1fr 1fr; align-content: start; gap: 14px; padding: 20px; }
 .task-form label, .modal-card label { display: flex; flex-direction: column; gap: 7px; color: var(--soft); font-size: 9px; font-weight: 650; }
-.task-form label.wide { grid-column: 1 / -1; }
+.task-form>.wide { grid-column: 1 / -1; min-width: 0; }
 .task-form input, .task-form textarea, .task-form select, .modal-card input { width: 100%; border: 1px solid var(--line-strong); border-radius: 8px; outline: 0; background: var(--surface-soft); color: var(--text); }
 .task-form input, .task-form select, .modal-card input { height: 38px; padding: 0 10px; }
 .task-form textarea { min-height: 280px; padding: 11px; resize: vertical; font: 11px/1.65 var(--mono); }
 .task-form input:focus, .task-form textarea:focus, .task-form select:focus, .modal-card input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
-.body-field { min-height: 340px; }
-.body-field textarea { flex: 1; }
+.body-field { min-height: 170px; }
+.body-field textarea { flex: 1; min-height: 150px; font-family: inherit; }
+.examples-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.examples-heading>div { display: grid; gap: 4px; }
+.examples-heading strong { font-size: 11px; }
+.examples-heading small { color: var(--muted); font-size: 9px; }
+.examples-heading button:disabled { opacity: .45; cursor: default; }
+.task-examples-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.example-form-row, .preview-example { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
+.example-form-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 10px; }
+.example-remove { width: 24px; height: 24px; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; }
+.example-remove:hover { background: var(--surface-hover); color: var(--text); }
+.example-form-fields, .preview-example>div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.example-form-fields textarea { min-height: 86px; font: 11px/1.5 var(--mono); }
+.preview-example { margin: 10px 0; }
+.preview-example>strong { display: block; margin-bottom: 10px; color: var(--text); }
+.preview-example section { min-width: 0; }
+.preview-example .preview-example-label { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 5px; color: var(--muted); font-size: 9px; }
+.preview-example .copy-example-button { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--soft); font-size: 14px; }
+.preview-example .copy-example-button:hover { border-color: var(--accent); color: var(--accent); }
+.preview-example pre { min-height: 40px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .source-view { display: flex; flex-direction: column; }
 .source-note { flex: none; padding: 10px 16px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 9px; }
 .source-note code { font-family: var(--mono); color: var(--accent); }
@@ -205,7 +225,21 @@ button { border: 0; cursor: pointer; }
 .remote-caret { position: absolute; width: 2px; height: 21px; background: var(--cursor-color); }
 .remote-caret { height: calc(var(--editor-font-size, 12px) * 1.75); }
 .remote-caret span { position: absolute; left: 0; top: -16px; padding: 2px 5px; border-radius: 4px 4px 4px 0; background: var(--cursor-color); color: white; font: 7px/12px sans-serif; white-space: nowrap; }
+.remote-caret span { animation: cursor-name-timeout 3s linear forwards; }
+.remote-caret span.quiet { opacity: 0; animation: none; }
+@keyframes cursor-name-timeout { 0%, 99% { opacity: 1; } 100% { opacity: 0; } }
+.disconnected-card { width: min(440px, calc(100vw - 36px)); }
+.disconnected-card p { color: var(--soft); font-size: 12px; line-height: 1.6; margin: 0; }
+.disconnected-actions { display: flex; gap: 9px; margin-top: 22px; flex-wrap: wrap; }
+.disconnected-actions .button { min-height: 38px; }
+@media (max-width: 1100px) {
+  body.is-browser-guest #lesson-button { display: inline-flex; }
+  body.is-browser-guest .course-title { display: none; }
+}
 .suggestion { position: sticky; left: 12px; bottom: 10px; width: max-content; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); color: var(--soft); font-size: 9px; box-shadow: var(--shadow); z-index: 5; }
+.suggestion { max-width: min(520px, 80vw); max-height: 150px; overflow: auto; white-space: pre-wrap; }
+.suggestion>span { display: inline-block; margin-right: 8px; color: var(--accent); font-weight: 700; }
+.suggestion>strong { font: 10px/1.5 var(--mono); }
 .suggestion kbd { margin-left: 8px; color: var(--muted); font: 8px var(--mono); }
 .output-panel { height: 150px; flex: none; display: flex; flex-direction: column; border-top: 1px solid var(--line); background: var(--surface-soft); }
 .output-header { height: 34px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 13px; border-bottom: 1px solid var(--line); }
@@ -255,8 +289,12 @@ button { border: 0; cursor: pointer; }
 .dependency-result.installed { color: var(--accent); }
 .dependency-result.missing { color: #c0392b; }
 .dependency-install { height: 28px; font-size: 9px; }
+.software-card .dependency-copy { flex: 1; }
+.software-card .dependency-copy small { font-family: var(--mono); }
 
 @media (max-width: 1180px) {
+  .home-heading { align-items: flex-start; flex-direction: column; }
+  .home-actions { justify-content: flex-start; }
   .workspace { grid-template-columns: 50px minmax(350px, .92fr) minmax(450px, 1.08fr); gap: 7px; }
   .participants, #lesson-button { display: none; }
   .course-title { font-size: 11px; }

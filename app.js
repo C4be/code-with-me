@@ -1,3 +1,5 @@
+import { HostBridge, GuestTransport } from "./peer-transport.js";
+
 let isPermissionGranted = async () => false;
 let requestPermission = async () => "denied";
 let sendNotification = () => {};
@@ -13,8 +15,8 @@ const CODE_EXTENSIONS = new Set(["py", "go", "cpp", "cc", "cxx", "java"]);
 const LANGUAGE_EXTENSIONS = { python: "py", go: "go", cpp: "cpp", java: "java" };
 const LANGUAGE_NAMES = { py: "Python", go: "Go", cpp: "C++", cc: "C++", cxx: "C++", java: "Java" };
 const CURSOR_COLORS = ["#6d59d9", "#d85b83", "#1a8f7a", "#c5782b", "#3d7bc8", "#aa5ca8"];
-const INSTALL_URLS = { python: "https://www.python.org/downloads/", go: "https://go.dev/dl/", cpp: "https://clang.llvm.org/get_started.html", java: "https://adoptium.net/temurin/releases/" };
 const EDITOR_FONT_SIZES = [10, 11, 12, 13, 14, 16, 18, 20, 22, 24];
+const MAX_EXAMPLES = 5;
 
 const initialTask = `---
 type: challenge
@@ -68,18 +70,33 @@ let renameTarget = null;
 let deleteTarget = null;
 let toastTimer = 0;
 let editorFontSize = Number(localStorage.getItem("code-with-me-editor-font-size")) || 12;
+let ollamaReady = false;
+let completionTimer = 0;
+let completionRevision = 0;
+let activeSuggestion = null;
+let completionRequestInFlight = false;
 const saveTimers = new Map();
+const liveTimers = new Map();
+const pendingWrites = new Map();
+const localRevisions = new Map();
+const seenRemoteRevisions = new Map();
 const presence = new Map();
+const remoteActivity = new Map();
+let presenceTimer = 0;
+let pendingPresenceActive = false;
 const roomState = {
   base: "",
   code: "",
   inviteUrl: "",
   host: false,
   local: true,
+  disconnected: false,
   socket: null,
+  transport: null,
   participantId: "",
   selfName: "",
   participants: [],
+  peerRoutes: new Map(),
 };
 
 const codeInput = $("#code-input");
@@ -167,7 +184,7 @@ function syncEditorFromRemote(content) {
   codeInput.setSelectionRange(Math.min(start, content.length), Math.min(end, content.length), direction);
   updateCursorStatus();
   renderRemoteCursors();
-  sendPresence();
+  sendPresence(false);
 }
 
 async function notifyDisconnected() {
@@ -237,6 +254,7 @@ function parseChallenge(source) {
       language: "python",
       entrypoint: "",
       body: String(source || ""),
+      examples: [],
     };
   }
   const metadata = {};
@@ -249,7 +267,37 @@ function parseChallenge(source) {
     metadata.theme = theme.trim();
     metadata.subtopic = rest.join("·").trim();
   }
-  return { ...metadata, body: match[2].trim() };
+  const { body, examples } = splitTaskExamples(match[2].trim());
+  return { ...metadata, body, examples };
+}
+
+function splitTaskExamples(body) {
+  const match = body.match(/(?:^|\n)### Примеры\s*\n([\s\S]*?)(?=\n###? |$)/);
+  if (!match) return { body, examples: [] };
+  const examples = [];
+  const blocks = [...match[1].matchAll(/#### Пример \d+\s*\n+\*\*Ввод\*\*\s*\n+```(?:text)?\n([\s\S]*?)\n```\s*\n+\*\*Вывод\*\*\s*\n+```(?:text)?\n([\s\S]*?)\n```/g)];
+  for (const block of blocks.slice(0, MAX_EXAMPLES)) examples.push({ input: block[1], output: block[2] });
+  if (!examples.length) {
+    for (const line of match[1].split("\n")) {
+      const legacy = line.match(/^[-*]\s+`([^`]+)`\s*→\s*`([^`]+)`/);
+      if (legacy && examples.length < MAX_EXAMPLES) examples.push({ input: legacy[1], output: legacy[2] });
+    }
+  }
+  if (!examples.length) return { body, examples: [] };
+  return { body: `${body.slice(0, match.index)}\n${body.slice(match.index + match[0].length)}`.trim(), examples };
+}
+
+function plainDescription(markdown) {
+  return String(markdown || "")
+    .replace(/^\s*```[^\n]*\n|^\s*```\s*$/gm, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^[-*]\s+/gm, "• ");
 }
 
 function composeChallenge(challenge) {
@@ -268,7 +316,7 @@ language: ${challenge.language || "python"}
 entrypoint: ${challenge.entrypoint || ""}
 ---
 
-${challenge.body?.trim() || "Опишите условие задания."}
+${challenge.body?.trim() || "Опишите условие задания."}${(challenge.examples || []).length ? `\n\n### Примеры\n\n${challenge.examples.slice(0, MAX_EXAMPLES).map((example, index) => `#### Пример ${index + 1}\n\n**Ввод**\n\n\`\`\`text\n${example.input || ""}\n\`\`\`\n\n**Вывод**\n\n\`\`\`text\n${example.output || ""}\n\`\`\``).join("\n\n")}` : ""}
 `;
 }
 
@@ -329,6 +377,7 @@ function renderRoomParticipants(participants = roomState.participants) {
   roomState.participants = participants;
   const liveIds = new Set(participants.map((person) => person.id));
   for (const id of presence.keys()) if (!liveIds.has(id)) presence.delete(id);
+  for (const id of remoteActivity.keys()) if (!liveIds.has(id)) remoteActivity.delete(id);
   const container = $("#participants");
   container.innerHTML = participants
     .map((person) => `<span class="avatar" style="background:${colorForId(person.id)};color:#fff" title="${escapeHTML(person.name)}${person.host ? " · ведущий" : ""}">${escapeHTML(initials(person.name))}</span>`)
@@ -480,7 +529,48 @@ function renderTaskPreview(challenge) {
   $("#task-title").textContent = challenge.title || "Новое задание";
   $("#task-difficulty").textContent = ({ easy: "ЛЁГКАЯ", medium: "СРЕДНЯЯ", hard: "СЛОЖНАЯ" })[challenge.difficulty] || "ЗАДАНИЕ";
   $("#task-meta").textContent = `⏱ ${challenge.time_limit || "—"} минут`;
-  $("#task-description").innerHTML = markdownToHTML(challenge.body);
+  const examples = (challenge.examples || []).slice(0, MAX_EXAMPLES);
+  const copyButton = (index, field, label) => `<button class="copy-example-button" type="button" data-copy-example-index="${index}" data-copy-example-field="${field}" title="Копировать ${label.toLowerCase()}" aria-label="Копировать ${label.toLowerCase()} примера ${index + 1}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button>`;
+  $("#task-description").innerHTML = `${markdownToHTML(challenge.body)}${examples.length ? `<h3>Примеры</h3>${examples.map((example, index) => `<div class="preview-example"><strong>Пример ${index + 1}</strong><div><section><div class="preview-example-label"><span>Ввод</span>${copyButton(index, "input", "Ввод")}</div><pre>${escapeHTML(example.input)}</pre></section><section><div class="preview-example-label"><span>Вывод</span>${copyButton(index, "output", "Вывод")}</div><pre>${escapeHTML(example.output)}</pre></section></div></div>`).join("")}` : ""}`;
+}
+
+async function writeClipboardText(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* В файловом предпросмотре API может быть недоступен. */ }
+  }
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Буфер обмена недоступен");
+}
+
+async function copyExample(button) {
+  const index = Number(button.dataset.copyExampleIndex);
+  const field = button.dataset.copyExampleField;
+  if (!Number.isInteger(index) || !["input", "output"].includes(field)) return;
+  const example = parseChallenge(files[currentTaskFile] || initialTask).examples?.[index];
+  if (!example) return;
+  try {
+    await writeClipboardText(example[field] || "");
+    showToast(`${field === "input" ? "Ввод" : "Вывод"} примера ${index + 1} скопирован`);
+  } catch (error) {
+    showToast(`Не удалось скопировать: ${error.message || error}`);
+  }
+}
+
+function renderExampleForm(examples = []) {
+  const container = $("#task-examples-form");
+  container.innerHTML = examples.slice(0, MAX_EXAMPLES).map((example, index) => `<article class="example-form-row" data-example-index="${index}"><div class="example-form-title"><strong>Пример ${index + 1}</strong><button type="button" class="example-remove" data-remove-example="${index}" aria-label="Удалить пример ${index + 1}">×</button></div><div class="example-form-fields"><label><span>Ввод</span><textarea data-example-input="${index}" spellcheck="false" placeholder="Что вводим">${escapeHTML(example.input)}</textarea></label><label><span>Вывод</span><textarea data-example-output="${index}" spellcheck="false" placeholder="Что получаем">${escapeHTML(example.output)}</textarea></label></div></article>`).join("");
+  $("#add-example-button").disabled = examples.length >= MAX_EXAMPLES;
+}
+
+function readExampleForm() {
+  return $$("#task-examples-form .example-form-row").map((row) => ({ input: row.querySelector("[data-example-input]").value, output: row.querySelector("[data-example-output]").value }));
 }
 
 function fillTaskForm(challenge) {
@@ -490,7 +580,8 @@ function fillTaskForm(challenge) {
   $("#task-field-difficulty").value = challenge.difficulty || "medium";
   $("#task-field-time").value = challenge.time_limit || "20";
   $("#task-field-language").value = challenge.language || "python";
-  $("#task-field-body").value = challenge.body || "";
+  $("#task-field-body").value = plainDescription(challenge.body);
+  renderExampleForm(challenge.examples || []);
 }
 
 function renderTask() {
@@ -524,7 +615,8 @@ function formChallenge() {
     time_limit: $("#task-field-time").value,
     language: $("#task-field-language").value,
     entrypoint: previous.entrypoint || taskSolutions[0]?.path || "",
-    body: $("#task-field-body").value,
+    body: $("#task-field-body").value === plainDescription(previous.body) ? previous.body : $("#task-field-body").value,
+    examples: readExampleForm(),
   };
 }
 
@@ -621,22 +713,47 @@ function renderRemoteCursors() {
     caret.style.top = `${(before.length - 1) * editorLineHeight()}px`;
     caret.style.left = `${before.at(-1).length * editorFontSize * 0.602}px`;
     caret.innerHTML = `<span>${escapeHTML(participant.name)}</span>`;
+    const elapsed = Date.now() - (remoteActivity.get(participantId) || 0);
+    if (elapsed >= 3000) caret.querySelector("span").classList.add("quiet");
+    else caret.querySelector("span").style.animationDelay = `-${Math.max(0, elapsed)}ms`;
     container.append(caret);
   }
 }
 
-function sendPresence() {
+function sendPresence(active = true) {
   if (!roomState.socket || roomState.socket.readyState !== WebSocket.OPEN || !activeFile) return;
-  roomState.socket.send(JSON.stringify({
-    type: "presence",
-    file: activeFile,
-    cursorStart: codeInput.selectionStart,
-    cursorEnd: codeInput.selectionEnd,
-  }));
+  pendingPresenceActive ||= active;
   if (roomState.participantId) {
+    const previousFile = presence.get(roomState.participantId)?.file;
     presence.set(roomState.participantId, { file: activeFile, cursorStart: codeInput.selectionStart, cursorEnd: codeInput.selectionEnd });
+    if (previousFile !== activeFile) renderSolutionTabs();
   }
-  renderSolutionTabs();
+  clearTimeout(presenceTimer);
+  presenceTimer = setTimeout(() => {
+    presenceTimer = 0;
+    if (roomState.socket?.readyState !== WebSocket.OPEN || !activeFile) return;
+    const wasActive = pendingPresenceActive;
+    pendingPresenceActive = false;
+    roomState.socket.send(JSON.stringify({
+      type: "presence",
+      file: activeFile,
+      cursorStart: codeInput.selectionStart,
+      cursorEnd: codeInput.selectionEnd,
+      active: wasActive,
+    }));
+  }, 45);
+}
+
+function sendLiveChange(path) {
+  if (!roomState.code || !roomState.socket || roomState.socket.readyState !== WebSocket.OPEN) return;
+  const revision = (localRevisions.get(path) || 0) + 1;
+  localRevisions.set(path, revision);
+  clearTimeout(liveTimers.get(path));
+  liveTimers.set(path, setTimeout(() => {
+    liveTimers.delete(path);
+    if (roomState.socket?.readyState !== WebSocket.OPEN) return;
+    roomState.socket.send(JSON.stringify({ type: "code:change", path, content: files[path], revision }));
+  }, 35));
 }
 
 function activateSolution(path, selectTask = true) {
@@ -669,6 +786,10 @@ function roomApiUrl(path, query = {}) {
 }
 
 async function roomFetch(path, options = {}, query = {}) {
+  if (roomState.transport instanceof GuestTransport) {
+    const body = await roomState.transport.request(path, options, query);
+    return body ? JSON.parse(body) : null;
+  }
   const response = await fetch(roomApiUrl(path, query), options);
   if (!response.ok) throw new Error((await response.text()) || `Ошибка комнаты (${response.status})`);
   if (response.status === 204) return null;
@@ -710,18 +831,35 @@ async function loadWorkspace() {
   refreshEditor(false);
 }
 
-async function persistFile(path, content) {
-  if (roomState.code) {
-    return roomFetch("/api/file", { method: "PUT", headers: { "Content-Type": "text/plain" }, body: content }, { path });
-  }
-  const invoke = window.__TAURI__?.core?.invoke;
-  if (invoke) return invoke("save_project_file", { path, content });
+async function persistFile(path, content, revision = localRevisions.get(path)) {
+  const roomCode = roomState.code;
+  const previous = pendingWrites.get(path) || Promise.resolve();
+  const write = previous.catch(() => {}).then(() => {
+    if (roomCode) {
+      if (roomState.code !== roomCode) throw new Error("Соединение с комнатой завершено");
+      const query = { path };
+      if (roomState.participantId) query.writer = roomState.participantId;
+      if (revision) query.revision = revision;
+      return roomFetch("/api/file", { method: "PUT", headers: { "Content-Type": "text/plain" }, body: content }, query);
+    }
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) return invoke("save_project_file", { path, content });
+  });
+  pendingWrites.set(path, write);
+  try { return await write; }
+  finally { if (pendingWrites.get(path) === write) pendingWrites.delete(path); }
 }
 
 function schedulePersist(path, content, isTask = false) {
+  if (roomState.disconnected && !window.__TAURI__?.core?.invoke) {
+    $("#sync-state").textContent = "● Новые правки не сохранены";
+    if (isTask) $("#task-save-state").textContent = "● Не сохранено";
+    return;
+  }
   clearTimeout(saveTimers.get(path));
   if (isTask) $("#task-save-state").textContent = "● Сохраняется…";
   saveTimers.set(path, setTimeout(async () => {
+    saveTimers.delete(path);
     try {
       await persistFile(path, content);
       if (isTask && path === currentTaskFile) $("#task-save-state").textContent = "● Сохранено";
@@ -887,7 +1025,7 @@ async function createTask() {
     time_limit: "20",
     language: "python",
     entrypoint: solutionPath,
-    body: "Опишите условие задания.\n\n### Примеры\n\n- `входные данные` → `ожидаемый результат`",
+    body: "Опишите условие задания.",
   });
   try {
     await createEntry(taskPath, source);
@@ -989,19 +1127,57 @@ async function runCode() {
   }
 }
 
-function setRoomChrome(label, online, local = false) {
+function setRoomChrome(label, online, local = false, detail = "") {
+  document.body.classList.toggle("is-browser-guest", !window.__TAURI__?.core?.invoke && (online || roomState.disconnected));
+  $("#sync-state").textContent = online ? "● Синхронизировано" : roomState.disconnected ? "● Сохраните контест" : "● Локально";
+  if (roomState.disconnected) $("#task-save-state").textContent = "● Только в этом окне";
   const state = $("#room-state");
   state.classList.toggle("room-idle", !online);
   state.querySelector("span").textContent = label;
-  $("#invite-button").disabled = !online;
-  $("#start-room-button").classList.toggle("hidden", online);
+  state.title = detail;
+  const mayInvite = online && roomState.host;
+  $("#invite-button").disabled = !mayInvite;
+  $("#invite-button").classList.toggle("hidden", !mayInvite);
+  $("#start-room-button").classList.toggle("hidden", online || !window.__TAURI__?.core?.invoke);
   $("#stop-room-button").classList.toggle("hidden", !online || !roomState.host);
   $("#close-contest-button").classList.remove("hidden");
   roomState.local = local;
 }
 
+function updateHostRouteChrome() {
+  if (!roomState.host) return;
+  const routes = [...roomState.peerRoutes.values()];
+  if (!routes.length) { setRoomChrome("Комната запущена", true); return; }
+  const direct = routes.filter((route) => route.kind === "direct").length;
+  const relay = routes.length - direct;
+  const label = routes.length === 1
+    ? direct ? "Гость напрямую" : "Гость через сервер"
+    : `${direct} напрямую · ${relay} через сервер`;
+  const detail = routes.map((route) => `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`).join("; ");
+  setRoomChrome(label, true, false, detail);
+}
+
+function applyRoomFileEvent(message) {
+  const path = message.path;
+  if (typeof path !== "string" || typeof message.content !== "string") return;
+  const writer = message.participantId || message.writer;
+  if (writer && writer === roomState.participantId) return;
+  if (writer && message.type === "code:change") remoteActivity.set(writer, Date.now());
+  const revision = Number(message.revision) || 0;
+  const revisionKey = writer ? `${writer}\0${path}` : "";
+  if (revisionKey && revision) {
+    if (revision <= (seenRemoteRevisions.get(revisionKey) || 0)) return;
+    seenRemoteRevisions.set(revisionKey, revision);
+  }
+  files[path] = message.content;
+  if (path === activeFile && codeInput.value !== message.content) syncEditorFromRemote(message.content);
+  renderRemoteCursors();
+  if (path === currentTaskFile && !$("#task-form").contains(document.activeElement) && document.activeElement !== $("#task-source-input")) renderTask();
+}
+
 async function connectRoom(info, host = false, guestName = "") {
   roomState.local = false;
+  roomState.disconnected = false;
   roomState.base = host && info.localBase ? info.localBase : new URL(info.inviteUrl).origin;
   roomState.code = info.inviteCode;
   roomState.inviteUrl = info.inviteUrl;
@@ -1011,15 +1187,43 @@ async function connectRoom(info, host = false, guestName = "") {
   setRoomChrome(host ? "Комната запущена" : "Вы в комнате", true);
   renderRoomParticipants();
   roomState.socket?.close();
-  const socketUrl = new URL("/ws", roomState.base);
-  socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
-  socketUrl.searchParams.set("code", roomState.code);
-  socketUrl.searchParams.set("name", roomState.selfName);
-  socketUrl.searchParams.set("host", String(host));
-  const socket = new WebSocket(socketUrl);
+  roomState.transport?.close();
+  let socket;
+  if (host) {
+    if (!info.localBase || !info.hostSecret) throw new Error("Приложение не получило локальный адрес или ключ ведущего");
+    const bridge = new HostBridge(info);
+    bridge.onRoute = (id, route) => {
+      if (roomState.transport !== bridge) return;
+      roomState.peerRoutes.set(id, route);
+      updateHostRouteChrome();
+    };
+    bridge.onPeerClose = (id) => {
+      roomState.peerRoutes.delete(id);
+      if (roomState.transport === bridge) updateHostRouteChrome();
+    };
+    await bridge.connect();
+    roomState.transport = bridge;
+    const socketUrl = new URL("/ws", roomState.base);
+    socketUrl.protocol = "ws:";
+    socketUrl.searchParams.set("code", roomState.code);
+    socketUrl.searchParams.set("name", roomState.selfName);
+    socketUrl.searchParams.set("host", "true");
+    socketUrl.searchParams.set("hostSecret", info.hostSecret);
+    socket = new WebSocket(socketUrl);
+  } else {
+    const transport = new GuestTransport(info);
+    transport.onRoute = (route) => {
+      if (roomState.transport !== transport) return;
+      const detail = `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`;
+      setRoomChrome(`${route.kind === "relay" ? "Через сервер" : "Напрямую"}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`, true, false, detail);
+    };
+    roomState.transport = transport;
+    socket = await transport.connect(roomState.selfName);
+  }
   roomState.socket = socket;
   await new Promise((resolve, reject) => {
     let ready = false;
+    const pendingFileEvents = [];
     socket.onmessage = async (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
@@ -1029,6 +1233,8 @@ async function connectRoom(info, host = false, guestName = "") {
         renderRoomParticipants(message.room.participants || []);
         try {
           await loadWorkspace();
+          for (const pending of pendingFileEvents) applyRoomFileEvent(pending);
+          pendingFileEvents.length = 0;
           if (!host) showWorkspace();
           ready = true;
           sendPresence();
@@ -1040,17 +1246,15 @@ async function connectRoom(info, host = false, guestName = "") {
       }
       if (message.type === "participants") renderRoomParticipants(message.participants || []);
       if (message.type === "presence" && message.participantId) {
+        const previousFile = presence.get(message.participantId)?.file;
+        if (message.active !== false) remoteActivity.set(message.participantId, Date.now());
         presence.set(message.participantId, message);
-        renderSolutionTabs();
+        if (previousFile !== message.file) renderSolutionTabs();
         renderRemoteCursors();
       }
-      if (message.type === "file:saved") {
-        files[message.path] = message.content;
-        if (message.path === activeFile && codeInput.value !== message.content) {
-          syncEditorFromRemote(message.content);
-        }
-        renderRemoteCursors();
-        if (message.path === currentTaskFile && !$("#task-form").contains(document.activeElement) && document.activeElement !== $("#task-source-input")) renderTask();
+      if (message.type === "file:saved" || message.type === "code:change") {
+        if (ready) applyRoomFileEvent(message);
+        else pendingFileEvents.push(message);
       }
       if (message.type === "file:created" || message.type === "file:renamed" || message.type === "file:deleted") await loadWorkspace();
     };
@@ -1064,7 +1268,9 @@ async function connectRoom(info, host = false, guestName = "") {
       }
       if (!host && roomState.socket === socket) {
         resetRoomConnection();
-        setRoomChrome("Соединение прервано", false);
+        roomState.disconnected = true;
+        setRoomChrome("Локально · сохраните контест", false, true);
+        $("#disconnected-modal").classList.remove("hidden");
         notifyDisconnected();
       }
     };
@@ -1082,12 +1288,17 @@ async function startRoom() {
   button.disabled = true;
   button.textContent = "Подключаем…";
   showToast("Подготавливаем публичную ссылку…", 90000);
+  let started = false;
   try {
     await persistWorkspace();
     const info = await invoke("start_room");
+    started = true;
     await connectRoom(info, true);
     showToast("Комната запущена");
   } catch (error) {
+    if (started) await invoke("stop_room").catch(() => {});
+    resetRoomConnection();
+    setRoomChrome("Локальная комната", false, true);
     showToast(`Не удалось создать комнату: ${error}`);
   } finally {
     button.disabled = false;
@@ -1097,20 +1308,36 @@ async function startRoom() {
 
 function resetRoomConnection() {
   const socket = roomState.socket;
+  for (const timer of saveTimers.values()) clearTimeout(timer);
+  saveTimers.clear();
+  roomState.transport?.close();
+  roomState.transport = null;
   roomState.base = "";
   roomState.code = "";
   roomState.inviteUrl = "";
   roomState.host = false;
+  roomState.disconnected = false;
   roomState.participantId = "";
   roomState.participants = [];
+  roomState.peerRoutes.clear();
+  for (const timer of liveTimers.values()) clearTimeout(timer);
+  liveTimers.clear();
+  clearTimeout(presenceTimer);
+  presenceTimer = 0;
+  pendingPresenceActive = false;
+  localRevisions.clear();
+  seenRemoteRevisions.clear();
   roomState.socket = null;
   presence.clear();
+  remoteActivity.clear();
   socket?.close();
   renderRoomParticipants([]);
 }
 
 async function stopRoom() {
   try {
+    if (activeFile) files[activeFile] = codeInput.value;
+    await persistWorkspace();
     await window.__TAURI__?.core?.invoke("stop_room");
     resetRoomConnection();
     setRoomChrome("Локальная комната", false, true);
@@ -1126,11 +1353,16 @@ async function prepareInvite(urlText) {
     throw new Error("Нужна HTTP или HTTPS ссылка-приглашение");
   }
   const code = invite.searchParams.get("code");
+  const roomId = invite.searchParams.get("room");
   if (!code || code.length > 128) throw new Error("В ссылке не найден код комнаты");
+  if (!roomId || roomId.length > 128) throw new Error("В ссылке не найден номер комнаты");
   roomState.base = invite.origin;
   roomState.code = code;
-  const info = await roomFetch("/api/room");
+  const response = await fetch(new URL(`/api/rooms/${encodeURIComponent(roomId)}?code=${encodeURIComponent(code)}`, invite.origin));
+  if (!response.ok) throw new Error("Комната недоступна");
+  const info = await response.json();
   if (!info?.inviteCode || info.inviteCode !== code) throw new Error("Ссылка недействительна");
+  if (!info.online) throw new Error("Ведущий ещё не подключился");
   if (info.participantCount >= info.maxParticipants) throw new Error("В комнате уже 10 участников");
   pendingRoomInfo = info;
   $("#join-name").value = localStorage.getItem("code-with-me-name") || "";
@@ -1184,13 +1416,14 @@ async function submitJoin(event) {
 }
 
 function showInvite() {
-  if (!roomState.inviteUrl) return;
+  if (!roomState.host || !roomState.inviteUrl) return;
   $("#invite-link").value = roomState.inviteUrl;
   $("#invite-modal").classList.remove("hidden");
   setTimeout(() => $("#invite-link").select(), 20);
 }
 
 async function copyInvite() {
+  if (!roomState.host) return;
   try {
     await navigator.clipboard.writeText(roomState.inviteUrl);
     showToast("Ссылка скопирована");
@@ -1211,29 +1444,80 @@ function downloadText(contents, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function serializeCurrentRoom(mode = "snapshot") {
+  return JSON.stringify({
+    format: "code-with-me-room",
+    version: 1,
+    mode,
+    name: parseChallenge(files[currentTaskFile] || "").title || "code-with-me",
+    files: Object.entries(files).map(([path, content]) => ({
+      path, kind: "file", encoding: "utf8", content: mode === "template" && isCodeFile(path) ? "" : content,
+    })),
+  }, null, 2);
+}
+
+async function saveDisconnectedContest() {
+  if (activeFile) files[activeFile] = codeInput.value;
+  const archive = serializeCurrentRoom();
+  const button = $("#save-disconnected-button");
+  button.disabled = true;
+  try {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      const name = await invoke("import_room_archive", { archive });
+      await loadWorkspace();
+      roomState.disconnected = false;
+      setRoomChrome("Локальная копия", false, true);
+      $("#sync-state").textContent = "● Сохранено локально";
+      showToast(`Контест сохранён локально: ${name}`);
+    } else {
+      downloadText(archive, "code-with-me-snapshot.cwmroom");
+      setRoomChrome("Локально · сохраняйте копию", false, true);
+      $("#sync-state").textContent = "● Копия скачана";
+      $("#task-save-state").textContent = "● Копия скачана";
+      showToast("Контест скачан. При дальнейших правках скачайте новую копию.");
+    }
+    $("#disconnected-modal").classList.add("hidden");
+  } catch (error) { showToast(`Не удалось сохранить контест: ${error.message || error}`, 6000); }
+  finally { button.disabled = false; }
+}
+
+async function leaveDisconnectedRoom() {
+  $("#disconnected-modal").classList.add("hidden");
+  roomState.disconnected = false;
+  files = { "task.cwm.md": initialTask, "0.solution-0.py": initialSolution };
+  currentTaskFile = "task.cwm.md";
+  activeFile = "0.solution-0.py";
+  setRoomChrome("Главное меню", false, true);
+  $(".workspace").classList.add("hidden");
+  $("#home-view").classList.remove("hidden");
+  $(".course-title").textContent = "";
+  $("#close-contest-button").classList.add("hidden");
+  await refreshContestList();
+}
+
 async function exportLesson(mode) {
   try {
     if (activeFile) files[activeFile] = codeInput.value;
-    await persistWorkspace();
+    if (!roomState.disconnected) await persistWorkspace();
     const name = `code-with-me-${mode === "template" ? "tasks" : "snapshot"}.cwmroom`;
-    if (roomState.code) {
-      const link = document.createElement("a");
-      link.href = roomApiUrl("/api/export", { mode });
-      link.download = name;
-      document.body.append(link);
-      link.click();
-      link.remove();
+    if (roomState.disconnected) {
+      downloadText(serializeCurrentRoom(mode), name);
+    } else if (roomState.code) {
+      if (roomState.transport instanceof GuestTransport) {
+        downloadText(await roomState.transport.request("/api/export", {}, { mode }), name);
+      } else {
+        const link = document.createElement("a");
+        link.href = roomApiUrl("/api/export", { mode });
+        link.download = name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+      }
     } else if (window.__TAURI__?.core?.invoke) {
       downloadText(await window.__TAURI__.core.invoke("export_room_archive", { mode }), name);
     } else {
-      const archive = {
-        format: "code-with-me-room",
-        version: 1,
-        mode,
-        name: "code-with-me",
-        files: Object.entries(files).map(([path, content]) => ({ path, kind: "file", encoding: "utf8", content: mode === "template" && isCodeFile(path) ? "" : content })),
-      };
-      downloadText(JSON.stringify(archive, null, 2), name);
+      downloadText(serializeCurrentRoom(mode), name);
     }
     $("#lesson-modal").classList.add("hidden");
     showToast(mode === "template" ? "Задачи сохранены без решений" : "Состояние занятия сохранено");
@@ -1294,31 +1578,68 @@ async function refreshContestList() {
   const saved = $("#saved-contest-list");
   if (!mine || !saved) return;
   let rooms = [];
-  if (window.__TAURI__?.core?.invoke) {
+  const isDesktop = Boolean(window.__TAURI__?.core?.invoke);
+  if (isDesktop) {
     try { rooms = await window.__TAURI__.core.invoke("list_local_rooms"); } catch (error) { console.warn("Не удалось загрузить контесты", error); }
   }
-  if (!rooms.length) rooms = [{ name: parseChallenge(files["task.cwm.md"] || initialTask).title || "Моё занятие", folder: "workspace", taskCount: taskFiles().length, category: "my" }];
+  if (!rooms.length && isDesktop) rooms = [{ name: parseChallenge(files["task.cwm.md"] || initialTask).title || "Моё занятие", folder: "workspace", taskCount: taskFiles().length, category: "my" }];
   const card = (room) => `<article class="contest-card"><span class="contest-card-icon">⌘</span><span class="contest-card-copy"><strong>${escapeHTML(room.name)}</strong><small>${room.taskCount} ${room.taskCount === 1 ? "задание" : "заданий"}</small></span><div class="contest-card-actions"><button class="contest-card-action open" data-contest-folder="${escapeHTML(room.folder)}">Открыть</button><button class="contest-card-action" data-export-folder="${escapeHTML(room.folder)}" data-export-name="${escapeHTML(room.name)}">Скачать</button>${room.folder === "workspace" ? "" : `<button class="contest-card-action delete" data-delete-folder="${escapeHTML(room.folder)}" data-delete-name="${escapeHTML(room.name)}">Удалить</button>`}</div></article>`;
   const ownRooms = rooms.filter((room) => room.category === "my");
   const savedRooms = rooms.filter((room) => room.category !== "my");
-  mine.innerHTML = ownRooms.length ? ownRooms.map(card).join("") : `<p class="empty-state">Пока нет своих контестов. Создайте новый кнопкой выше.</p>`;
+  mine.innerHTML = ownRooms.length ? ownRooms.map(card).join("") : `<p class="empty-state">${isDesktop ? "Пока нет своих контестов. Создайте новый кнопкой выше." : "В браузере контесты не хранятся. Откройте приглашение или скачайте настольное приложение."}</p>`;
   saved.innerHTML = savedRooms.length ? savedRooms.map(card).join("") : `<p class="empty-state">Здесь появятся импортированные файлы и сохранённые занятия.</p>`;
   await refreshDependencies();
 }
 
 async function refreshDependencies() {
   const container = $("#dependency-list");
+  const software = $("#software-list");
   if (!container) return;
   const invoke = window.__TAURI__?.core?.invoke;
   if (!invoke) {
     container.innerHTML = `<p class="empty-state">Проверка зависимостей доступна в настольном приложении.</p>`;
+    software.innerHTML = `<p class="empty-state">Настройки софта доступны в настольном приложении.</p>`;
     return;
   }
   try {
     const dependencies = await invoke("check_dependencies");
-    container.innerHTML = dependencies.map((item) => `<article class="dependency-card"><span class="dependency-status ${item.installed ? "installed" : "missing"}">${item.installed ? "✓" : "!"}</span><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.installed ? (item.version || "Найдено в системе") : item.description)}</small></span><span class="dependency-result ${item.installed ? "installed" : "missing"}">${item.installed ? "Установлено" : "Не найдено"}</span>${item.installed ? "" : `<button class="button secondary dependency-install" data-dependency="${escapeHTML(item.id)}">Установить</button>`}</article>`).join("");
+    ollamaReady = dependencies.some((item) => item.id === "ollama-model" && item.installed);
+    const ollamaInstalled = dependencies.some((item) => item.id === "ollama" && item.installed);
+    container.innerHTML = dependencies.map((item) => `<article class="dependency-card"><span class="dependency-status ${item.installed ? "installed" : "missing"}">${item.installed ? "✓" : "!"}</span><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.installed ? (item.version || "Найдено в системе") : item.description)}</small></span><span class="dependency-result ${item.installed ? "installed" : "missing"}">${item.installed ? "Установлено" : "Не найдено"}</span>${item.installed ? "" : `<button class="button secondary dependency-install" data-dependency="${escapeHTML(item.id)}" ${item.id === "ollama-model" && !ollamaInstalled ? "disabled title=\"Сначала установите Ollama\"" : ""}>${item.id === "ollama-model" ? "Скачать модель" : "Установить"}</button>`}</article>`).join("");
+    software.innerHTML = dependencies.map((item) => `<article class="dependency-card software-card"><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.path || "Путь появится после установки")}</small></span>${item.managed ? `<button class="button secondary dependency-install" data-remove-dependency="${escapeHTML(item.id)}">Очистить</button>` : `<span class="dependency-result">${item.installed ? "Установлено в системе" : "Не установлено"}</span>`}</article>`).join("");
   } catch (error) {
     container.innerHTML = `<p class="empty-state">Не удалось проверить зависимости: ${escapeHTML(error.message || error)}</p>`;
+    software.innerHTML = "";
+  }
+}
+
+async function installDependency(id, button) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!invoke) return;
+  button.disabled = true;
+  button.textContent = id === "ollama-model" ? "Скачиваем модель…" : "Устанавливаем…";
+  showToast("Загрузка и установка запущены. Окно может оставаться открытым несколько минут.", 5000);
+  try {
+    const message = await invoke("install_dependency", { id });
+    showToast(message, 6000);
+  } catch (error) {
+    showToast(`Не удалось установить: ${error.message || error}`, 7000);
+  } finally {
+    await refreshDependencies();
+  }
+}
+
+async function removeManagedDependency(id, button) {
+  if (!window.confirm("Удалить компонент, установленный через Code with me?")) return;
+  button.disabled = true;
+  button.textContent = "Очищаем…";
+  try {
+    await window.__TAURI__.core.invoke("remove_managed_dependency", { id });
+    showToast("Компонент удалён");
+  } catch (error) {
+    showToast(`Не удалось очистить: ${error.message || error}`, 7000);
+  } finally {
+    await refreshDependencies();
   }
 }
 
@@ -1364,13 +1685,6 @@ async function renameSelf(event) {
   showToast("Имя обновлено");
 }
 
-async function openDependencyPage(id) {
-  try {
-    if (window.__TAURI__?.core?.invoke) await window.__TAURI__.core.invoke("open_dependency_page", { id });
-    else window.open(INSTALL_URLS[id], "_blank", "noopener");
-  } catch (error) { showToast(`Не удалось открыть установщик: ${error.message || error}`); }
-}
-
 async function exportLocalContest(folder, name) {
   try {
     const archive = await window.__TAURI__.core.invoke("export_local_contest", { folder });
@@ -1382,6 +1696,7 @@ async function exportLocalContest(folder, name) {
 
 async function showHome() {
   if (activeFile && codeInput.value !== files[activeFile]) files[activeFile] = codeInput.value;
+  if (roomState.disconnected) { $("#disconnected-modal").classList.remove("hidden"); return; }
   try { await persistWorkspace(); } catch (error) { showToast(`Не удалось сохранить: ${error.message || error}`); return; }
   const stopHostedRoom = roomState.host;
   if (roomState.socket) resetRoomConnection();
@@ -1425,8 +1740,35 @@ function updateCompletion() {
   const before = codeInput.value.slice(0, codeInput.selectionStart);
   const partial = before.match(/[A-Za-z_]\w*$/)?.[0] || "";
   const suggestion = partial ? words.find((word) => word.startsWith(partial) && word !== partial) : "";
-  $("#suggestion-word").textContent = suggestion || "";
-  $("#suggestion").classList.toggle("hidden", !suggestion);
+  activeSuggestion = suggestion ? { text: suggestion, replace: partial.length, kind: "Синтаксис" } : null;
+  showCompletion();
+  clearTimeout(completionTimer);
+  const revision = ++completionRevision;
+  if (!ollamaReady || !activeFile || !window.__TAURI__?.core?.invoke || codeInput.selectionStart !== codeInput.selectionEnd) return;
+  const file = activeFile;
+  const cursor = codeInput.selectionStart;
+  const source = codeInput.value;
+  if (cursor < 3 || !source.slice(0, cursor).trim()) return;
+  completionTimer = setTimeout(async () => {
+    if (completionRequestInFlight) return;
+    completionRequestInFlight = true;
+    try {
+      const text = await window.__TAURI__.core.invoke("ollama_complete", { prefix: source.slice(0, cursor), suffix: source.slice(cursor), language });
+      if (revision !== completionRevision || activeFile !== file || codeInput.value !== source || codeInput.selectionStart !== cursor || !text.trim()) return;
+      activeSuggestion = { text, replace: 0, kind: "Ollama" };
+      showCompletion();
+    } catch { /* Локальная модель может быть временно недоступна. */ }
+    finally {
+      completionRequestInFlight = false;
+      if (revision !== completionRevision && document.activeElement === codeInput) updateCompletion();
+    }
+  }, 650);
+}
+
+function showCompletion() {
+  $("#suggestion-kind").textContent = activeSuggestion?.kind || "";
+  $("#suggestion-word").textContent = activeSuggestion?.text || "";
+  $("#suggestion").classList.toggle("hidden", !activeSuggestion);
 }
 
 async function restore() {
@@ -1472,7 +1814,11 @@ function init() {
   $("#refresh-dependencies-button").addEventListener("click", refreshDependencies);
   $("#dependency-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-dependency]");
-    if (button) openDependencyPage(button.dataset.dependency);
+    if (button) installDependency(button.dataset.dependency, button);
+  });
+  $("#software-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-dependency]");
+    if (button) removeManagedDependency(button.dataset.removeDependency, button);
   });
   $("#font-smaller").addEventListener("click", () => {
     const index = EDITOR_FONT_SIZES.indexOf(editorFontSize);
@@ -1492,7 +1838,27 @@ function init() {
   });
   $("#task-form").addEventListener("input", handleTaskFormInput);
   $("#task-form").addEventListener("change", handleTaskFormInput);
+  $("#add-example-button").addEventListener("click", () => {
+    const examples = readExampleForm();
+    if (examples.length >= MAX_EXAMPLES) return;
+    examples.push({ input: "", output: "" });
+    renderExampleForm(examples);
+    handleTaskFormInput();
+    $("#task-examples-form .example-form-row:last-child textarea")?.focus();
+  });
+  $("#task-examples-form").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-example]");
+    if (!button) return;
+    const examples = readExampleForm();
+    examples.splice(Number(button.dataset.removeExample), 1);
+    renderExampleForm(examples);
+    handleTaskFormInput();
+  });
   $("#task-source-input").addEventListener("input", handleTaskSourceInput);
+  $("#task-preview-view").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-copy-example-index]");
+    if (button) copyExample(button);
+  });
   $("#task-rail").addEventListener("click", (event) => {
     const task = event.target.closest("[data-task-file]");
     if (task) selectTask(task.dataset.taskFile);
@@ -1530,6 +1896,7 @@ function init() {
     $("#line-numbers").innerHTML = Array.from({ length: count }, (_, index) => index + 1).join("<br>");
     codeInput.style.height = `${Math.max($("#code-wrap").clientHeight - 35, count * editorLineHeight())}px`;
     schedulePersist(activeFile, codeInput.value);
+    sendLiveChange(activeFile);
     updateCursorStatus();
     updateCompletion();
     sendPresence();
@@ -1540,11 +1907,10 @@ function init() {
   codeInput.addEventListener("keydown", (event) => {
     if (event.key === "Tab") {
       event.preventDefault();
-      const suggestion = $("#suggestion-word").textContent;
-      const before = codeInput.value.slice(0, codeInput.selectionStart);
-      const partial = before.match(/[A-Za-z_]\w*$/)?.[0] || "";
-      if (suggestion && partial) {
-        codeInput.setRangeText(suggestion, codeInput.selectionStart - partial.length, codeInput.selectionStart, "end");
+      if (activeSuggestion) {
+        codeInput.setRangeText(activeSuggestion.text, codeInput.selectionStart - activeSuggestion.replace, codeInput.selectionStart, "end");
+        activeSuggestion = null;
+        showCompletion();
       } else {
         codeInput.setRangeText("    ", codeInput.selectionStart, codeInput.selectionEnd, "end");
       }
@@ -1564,6 +1930,8 @@ function init() {
   $("#copy-invite-button").addEventListener("click", copyInvite);
   $("#join-form").addEventListener("submit", submitJoin);
   $("#lesson-button").addEventListener("click", () => $("#lesson-modal").classList.remove("hidden"));
+  $("#save-disconnected-button").addEventListener("click", saveDisconnectedContest);
+  $("#leave-disconnected-button").addEventListener("click", leaveDisconnectedRoom);
   $$("[data-export-mode]").forEach((button) => button.addEventListener("click", () => exportLesson(button.dataset.exportMode)));
   $("#open-room-file").addEventListener("click", () => $("#room-file-input").click());
   $("#room-file-input").addEventListener("change", importRoomFile);
@@ -1571,6 +1939,7 @@ function init() {
   $("#close-contest-button").addEventListener("click", showHome);
   $(".brand").addEventListener("click", (event) => { event.preventDefault(); showHome(); });
   $("#home-import-button").addEventListener("click", () => $("#home-file-input").click());
+  $("#home-settings-button").addEventListener("click", () => $("#software-section").scrollIntoView({ behavior: "smooth", block: "start" }));
   $("#home-connect-button").addEventListener("click", () => {
     $("#connect-room-url").value = "";
     $("#connect-room-modal").classList.remove("hidden");

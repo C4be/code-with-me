@@ -44,10 +44,11 @@
       </header>
 
       <main class="home-view hidden" id="home-view">
-        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-connect-button">Подключиться по ссылке</button><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
+        <section class="home-heading"><div><span>ВАША БИБЛИОТЕКА</span><h1>Контесты</h1><p>Создавайте занятия, открывайте сохранённые или проверяйте инструменты для запуска кода.</p></div><div class="home-actions"><button class="button secondary" id="home-settings-button">Настройки</button><button class="button secondary" id="home-connect-button">Подключиться по ссылке</button><button class="button secondary" id="home-import-button">Импортировать</button><button class="button primary" id="create-contest-button">＋ Создать контест</button></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Мои контесты</h2><span>Созданные на этом компьютере</span></div><div class="contest-list" id="my-contest-list" aria-label="Мои контесты"></div></section>
         <section class="home-section"><div class="home-section-heading"><h2>Сохранённые и импортированные</h2><span>Снимки занятий и загруженные контесты</span></div><div class="contest-list" id="saved-contest-list" aria-label="Сохранённые контесты"></div></section>
-        <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Компиляторы и интерпретаторы, необходимые для запуска решений на этом компьютере</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные языки…</p></div></section>
+        <section class="home-section dependency-section"><div class="home-section-heading"><div><h2>Проверка зависимостей</h2><span>Языки программирования и локальное дополнение кода</span></div><button class="button secondary" id="refresh-dependencies-button">Проверить снова</button></div><div class="dependency-list" id="dependency-list"><p class="empty-state">Проверяем установленные инструменты…</p></div></section>
+        <section class="home-section software-section" id="software-section"><div class="home-section-heading"><div><h2>Настройки · Софт</h2><span>Расположение инструментов и очистка установленных через приложение компонентов</span></div></div><div class="dependency-list" id="software-list"></div></section>
         <input id="home-file-input" type="file" accept=".cwmroom,application/json" hidden />
       </main>
 
@@ -75,7 +76,9 @@
               <label><span>Сложность</span><select id="task-field-difficulty"><option value="easy">Лёгкая</option><option value="medium">Средняя</option><option value="hard">Сложная</option></select></label>
               <label><span>Минуты</span><input id="task-field-time" type="number" min="1" max="600" /></label>
               <label><span>Язык решений</span><select id="task-field-language"><option value="python">Python</option><option value="go">Go</option><option value="cpp">C++</option><option value="java">Java</option></select></label>
-              <label class="wide body-field"><span>Текст задания · Markdown</span><textarea id="task-field-body" spellcheck="true"></textarea></label>
+              <label class="wide body-field"><span>Описание задачи</span><textarea id="task-field-body" spellcheck="true" placeholder="Опишите, что нужно сделать. Markdown здесь не нужен."></textarea></label>
+              <div class="wide examples-heading"><div><strong>Примеры</strong><small>Укажите входные данные и ожидаемый результат</small></div><button class="button secondary" id="add-example-button" type="button">＋ Добавить пример</button></div>
+              <div class="wide task-examples-form" id="task-examples-form"></div>
             </form>
           </div>
 
@@ -118,7 +121,7 @@
               <pre aria-hidden="true"><code id="highlight-code"></code></pre>
               <textarea id="code-input" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Редактор кода" wrap="off"></textarea>
               <div class="remote-cursors" id="remote-cursors" aria-hidden="true"></div>
-              <div class="suggestion hidden" id="suggestion"><strong id="suggestion-word"></strong><kbd>Tab</kbd></div>
+              <div class="suggestion hidden" id="suggestion"><span id="suggestion-kind">Подсказка</span><strong id="suggestion-word"></strong><kbd>Tab</kbd></div>
             </div>
           </div>
           <div class="output-panel" id="output-panel">

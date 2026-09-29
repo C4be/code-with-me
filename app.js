@@ -15,8 +15,8 @@ const CODE_EXTENSIONS = new Set(["py", "go", "cpp", "cc", "cxx", "java"]);
 const LANGUAGE_EXTENSIONS = { python: "py", go: "go", cpp: "cpp", java: "java" };
 const LANGUAGE_NAMES = { py: "Python", go: "Go", cpp: "C++", cc: "C++", cxx: "C++", java: "Java" };
 const CURSOR_COLORS = ["#6d59d9", "#d85b83", "#1a8f7a", "#c5782b", "#3d7bc8", "#aa5ca8"];
-const INSTALL_URLS = { python: "https://www.python.org/downloads/", go: "https://go.dev/dl/", cpp: "https://clang.llvm.org/get_started.html", java: "https://adoptium.net/temurin/releases/" };
 const EDITOR_FONT_SIZES = [10, 11, 12, 13, 14, 16, 18, 20, 22, 24];
+const MAX_EXAMPLES = 5;
 
 const initialTask = `---
 type: challenge
@@ -70,6 +70,11 @@ let renameTarget = null;
 let deleteTarget = null;
 let toastTimer = 0;
 let editorFontSize = Number(localStorage.getItem("code-with-me-editor-font-size")) || 12;
+let ollamaReady = false;
+let completionTimer = 0;
+let completionRevision = 0;
+let activeSuggestion = null;
+let completionRequestInFlight = false;
 const saveTimers = new Map();
 const presence = new Map();
 const roomState = {
@@ -240,6 +245,7 @@ function parseChallenge(source) {
       language: "python",
       entrypoint: "",
       body: String(source || ""),
+      examples: [],
     };
   }
   const metadata = {};
@@ -252,7 +258,37 @@ function parseChallenge(source) {
     metadata.theme = theme.trim();
     metadata.subtopic = rest.join("·").trim();
   }
-  return { ...metadata, body: match[2].trim() };
+  const { body, examples } = splitTaskExamples(match[2].trim());
+  return { ...metadata, body, examples };
+}
+
+function splitTaskExamples(body) {
+  const match = body.match(/(?:^|\n)### Примеры\s*\n([\s\S]*?)(?=\n###? |$)/);
+  if (!match) return { body, examples: [] };
+  const examples = [];
+  const blocks = [...match[1].matchAll(/#### Пример \d+\s*\n+\*\*Ввод\*\*\s*\n+```(?:text)?\n([\s\S]*?)\n```\s*\n+\*\*Вывод\*\*\s*\n+```(?:text)?\n([\s\S]*?)\n```/g)];
+  for (const block of blocks.slice(0, MAX_EXAMPLES)) examples.push({ input: block[1], output: block[2] });
+  if (!examples.length) {
+    for (const line of match[1].split("\n")) {
+      const legacy = line.match(/^[-*]\s+`([^`]+)`\s*→\s*`([^`]+)`/);
+      if (legacy && examples.length < MAX_EXAMPLES) examples.push({ input: legacy[1], output: legacy[2] });
+    }
+  }
+  if (!examples.length) return { body, examples: [] };
+  return { body: `${body.slice(0, match.index)}\n${body.slice(match.index + match[0].length)}`.trim(), examples };
+}
+
+function plainDescription(markdown) {
+  return String(markdown || "")
+    .replace(/^\s*```[^\n]*\n|^\s*```\s*$/gm, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^[-*]\s+/gm, "• ");
 }
 
 function composeChallenge(challenge) {
@@ -271,7 +307,7 @@ language: ${challenge.language || "python"}
 entrypoint: ${challenge.entrypoint || ""}
 ---
 
-${challenge.body?.trim() || "Опишите условие задания."}
+${challenge.body?.trim() || "Опишите условие задания."}${(challenge.examples || []).length ? `\n\n### Примеры\n\n${challenge.examples.slice(0, MAX_EXAMPLES).map((example, index) => `#### Пример ${index + 1}\n\n**Ввод**\n\n\`\`\`text\n${example.input || ""}\n\`\`\`\n\n**Вывод**\n\n\`\`\`text\n${example.output || ""}\n\`\`\``).join("\n\n")}` : ""}
 `;
 }
 
@@ -483,7 +519,18 @@ function renderTaskPreview(challenge) {
   $("#task-title").textContent = challenge.title || "Новое задание";
   $("#task-difficulty").textContent = ({ easy: "ЛЁГКАЯ", medium: "СРЕДНЯЯ", hard: "СЛОЖНАЯ" })[challenge.difficulty] || "ЗАДАНИЕ";
   $("#task-meta").textContent = `⏱ ${challenge.time_limit || "—"} минут`;
-  $("#task-description").innerHTML = markdownToHTML(challenge.body);
+  const examples = (challenge.examples || []).slice(0, MAX_EXAMPLES);
+  $("#task-description").innerHTML = `${markdownToHTML(challenge.body)}${examples.length ? `<h3>Примеры</h3>${examples.map((example, index) => `<div class="preview-example"><strong>Пример ${index + 1}</strong><div><section><span>Ввод</span><pre>${escapeHTML(example.input)}</pre></section><section><span>Вывод</span><pre>${escapeHTML(example.output)}</pre></section></div></div>`).join("")}` : ""}`;
+}
+
+function renderExampleForm(examples = []) {
+  const container = $("#task-examples-form");
+  container.innerHTML = examples.slice(0, MAX_EXAMPLES).map((example, index) => `<article class="example-form-row" data-example-index="${index}"><div class="example-form-title"><strong>Пример ${index + 1}</strong><button type="button" class="example-remove" data-remove-example="${index}" aria-label="Удалить пример ${index + 1}">×</button></div><div class="example-form-fields"><label><span>Ввод</span><textarea data-example-input="${index}" spellcheck="false" placeholder="Что вводим">${escapeHTML(example.input)}</textarea></label><label><span>Вывод</span><textarea data-example-output="${index}" spellcheck="false" placeholder="Что получаем">${escapeHTML(example.output)}</textarea></label></div></article>`).join("");
+  $("#add-example-button").disabled = examples.length >= MAX_EXAMPLES;
+}
+
+function readExampleForm() {
+  return $$("#task-examples-form .example-form-row").map((row) => ({ input: row.querySelector("[data-example-input]").value, output: row.querySelector("[data-example-output]").value }));
 }
 
 function fillTaskForm(challenge) {
@@ -493,7 +540,8 @@ function fillTaskForm(challenge) {
   $("#task-field-difficulty").value = challenge.difficulty || "medium";
   $("#task-field-time").value = challenge.time_limit || "20";
   $("#task-field-language").value = challenge.language || "python";
-  $("#task-field-body").value = challenge.body || "";
+  $("#task-field-body").value = plainDescription(challenge.body);
+  renderExampleForm(challenge.examples || []);
 }
 
 function renderTask() {
@@ -527,7 +575,8 @@ function formChallenge() {
     time_limit: $("#task-field-time").value,
     language: $("#task-field-language").value,
     entrypoint: previous.entrypoint || taskSolutions[0]?.path || "",
-    body: $("#task-field-body").value,
+    body: $("#task-field-body").value === plainDescription(previous.body) ? previous.body : $("#task-field-body").value,
+    examples: readExampleForm(),
   };
 }
 
@@ -894,7 +943,7 @@ async function createTask() {
     time_limit: "20",
     language: "python",
     entrypoint: solutionPath,
-    body: "Опишите условие задания.\n\n### Примеры\n\n- `входные данные` → `ожидаемый результат`",
+    body: "Опишите условие задания.",
   });
   try {
     await createEntry(taskPath, source);
@@ -1347,17 +1396,53 @@ async function refreshContestList() {
 
 async function refreshDependencies() {
   const container = $("#dependency-list");
+  const software = $("#software-list");
   if (!container) return;
   const invoke = window.__TAURI__?.core?.invoke;
   if (!invoke) {
     container.innerHTML = `<p class="empty-state">Проверка зависимостей доступна в настольном приложении.</p>`;
+    software.innerHTML = `<p class="empty-state">Настройки софта доступны в настольном приложении.</p>`;
     return;
   }
   try {
     const dependencies = await invoke("check_dependencies");
-    container.innerHTML = dependencies.map((item) => `<article class="dependency-card"><span class="dependency-status ${item.installed ? "installed" : "missing"}">${item.installed ? "✓" : "!"}</span><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.installed ? (item.version || "Найдено в системе") : item.description)}</small></span><span class="dependency-result ${item.installed ? "installed" : "missing"}">${item.installed ? "Установлено" : "Не найдено"}</span>${item.installed ? "" : `<button class="button secondary dependency-install" data-dependency="${escapeHTML(item.id)}">Установить</button>`}</article>`).join("");
+    ollamaReady = dependencies.some((item) => item.id === "ollama-model" && item.installed);
+    const ollamaInstalled = dependencies.some((item) => item.id === "ollama" && item.installed);
+    container.innerHTML = dependencies.map((item) => `<article class="dependency-card"><span class="dependency-status ${item.installed ? "installed" : "missing"}">${item.installed ? "✓" : "!"}</span><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.installed ? (item.version || "Найдено в системе") : item.description)}</small></span><span class="dependency-result ${item.installed ? "installed" : "missing"}">${item.installed ? "Установлено" : "Не найдено"}</span>${item.installed ? "" : `<button class="button secondary dependency-install" data-dependency="${escapeHTML(item.id)}" ${item.id === "ollama-model" && !ollamaInstalled ? "disabled title=\"Сначала установите Ollama\"" : ""}>${item.id === "ollama-model" ? "Скачать модель" : "Установить"}</button>`}</article>`).join("");
+    software.innerHTML = dependencies.map((item) => `<article class="dependency-card software-card"><span class="dependency-copy"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.path || "Путь появится после установки")}</small></span>${item.managed ? `<button class="button secondary dependency-install" data-remove-dependency="${escapeHTML(item.id)}">Очистить</button>` : `<span class="dependency-result">${item.installed ? "Установлено в системе" : "Не установлено"}</span>`}</article>`).join("");
   } catch (error) {
     container.innerHTML = `<p class="empty-state">Не удалось проверить зависимости: ${escapeHTML(error.message || error)}</p>`;
+    software.innerHTML = "";
+  }
+}
+
+async function installDependency(id, button) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!invoke) return;
+  button.disabled = true;
+  button.textContent = id === "ollama-model" ? "Скачиваем модель…" : "Устанавливаем…";
+  showToast("Загрузка и установка запущены. Окно может оставаться открытым несколько минут.", 5000);
+  try {
+    const message = await invoke("install_dependency", { id });
+    showToast(message, 6000);
+  } catch (error) {
+    showToast(`Не удалось установить: ${error.message || error}`, 7000);
+  } finally {
+    await refreshDependencies();
+  }
+}
+
+async function removeManagedDependency(id, button) {
+  if (!window.confirm("Удалить компонент, установленный через Code with me?")) return;
+  button.disabled = true;
+  button.textContent = "Очищаем…";
+  try {
+    await window.__TAURI__.core.invoke("remove_managed_dependency", { id });
+    showToast("Компонент удалён");
+  } catch (error) {
+    showToast(`Не удалось очистить: ${error.message || error}`, 7000);
+  } finally {
+    await refreshDependencies();
   }
 }
 
@@ -1401,13 +1486,6 @@ async function renameSelf(event) {
   }
   $("#profile-modal").classList.add("hidden");
   showToast("Имя обновлено");
-}
-
-async function openDependencyPage(id) {
-  try {
-    if (window.__TAURI__?.core?.invoke) await window.__TAURI__.core.invoke("open_dependency_page", { id });
-    else window.open(INSTALL_URLS[id], "_blank", "noopener");
-  } catch (error) { showToast(`Не удалось открыть установщик: ${error.message || error}`); }
 }
 
 async function exportLocalContest(folder, name) {
@@ -1464,8 +1542,35 @@ function updateCompletion() {
   const before = codeInput.value.slice(0, codeInput.selectionStart);
   const partial = before.match(/[A-Za-z_]\w*$/)?.[0] || "";
   const suggestion = partial ? words.find((word) => word.startsWith(partial) && word !== partial) : "";
-  $("#suggestion-word").textContent = suggestion || "";
-  $("#suggestion").classList.toggle("hidden", !suggestion);
+  activeSuggestion = suggestion ? { text: suggestion, replace: partial.length, kind: "Синтаксис" } : null;
+  showCompletion();
+  clearTimeout(completionTimer);
+  const revision = ++completionRevision;
+  if (!ollamaReady || !activeFile || !window.__TAURI__?.core?.invoke || codeInput.selectionStart !== codeInput.selectionEnd) return;
+  const file = activeFile;
+  const cursor = codeInput.selectionStart;
+  const source = codeInput.value;
+  if (cursor < 3 || !source.slice(0, cursor).trim()) return;
+  completionTimer = setTimeout(async () => {
+    if (completionRequestInFlight) return;
+    completionRequestInFlight = true;
+    try {
+      const text = await window.__TAURI__.core.invoke("ollama_complete", { prefix: source.slice(0, cursor), suffix: source.slice(cursor), language });
+      if (revision !== completionRevision || activeFile !== file || codeInput.value !== source || codeInput.selectionStart !== cursor || !text.trim()) return;
+      activeSuggestion = { text, replace: 0, kind: "Ollama" };
+      showCompletion();
+    } catch { /* Локальная модель может быть временно недоступна. */ }
+    finally {
+      completionRequestInFlight = false;
+      if (revision !== completionRevision && document.activeElement === codeInput) updateCompletion();
+    }
+  }, 650);
+}
+
+function showCompletion() {
+  $("#suggestion-kind").textContent = activeSuggestion?.kind || "";
+  $("#suggestion-word").textContent = activeSuggestion?.text || "";
+  $("#suggestion").classList.toggle("hidden", !activeSuggestion);
 }
 
 async function restore() {
@@ -1511,7 +1616,11 @@ function init() {
   $("#refresh-dependencies-button").addEventListener("click", refreshDependencies);
   $("#dependency-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-dependency]");
-    if (button) openDependencyPage(button.dataset.dependency);
+    if (button) installDependency(button.dataset.dependency, button);
+  });
+  $("#software-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-dependency]");
+    if (button) removeManagedDependency(button.dataset.removeDependency, button);
   });
   $("#font-smaller").addEventListener("click", () => {
     const index = EDITOR_FONT_SIZES.indexOf(editorFontSize);
@@ -1531,6 +1640,22 @@ function init() {
   });
   $("#task-form").addEventListener("input", handleTaskFormInput);
   $("#task-form").addEventListener("change", handleTaskFormInput);
+  $("#add-example-button").addEventListener("click", () => {
+    const examples = readExampleForm();
+    if (examples.length >= MAX_EXAMPLES) return;
+    examples.push({ input: "", output: "" });
+    renderExampleForm(examples);
+    handleTaskFormInput();
+    $("#task-examples-form .example-form-row:last-child textarea")?.focus();
+  });
+  $("#task-examples-form").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-example]");
+    if (!button) return;
+    const examples = readExampleForm();
+    examples.splice(Number(button.dataset.removeExample), 1);
+    renderExampleForm(examples);
+    handleTaskFormInput();
+  });
   $("#task-source-input").addEventListener("input", handleTaskSourceInput);
   $("#task-rail").addEventListener("click", (event) => {
     const task = event.target.closest("[data-task-file]");
@@ -1579,11 +1704,10 @@ function init() {
   codeInput.addEventListener("keydown", (event) => {
     if (event.key === "Tab") {
       event.preventDefault();
-      const suggestion = $("#suggestion-word").textContent;
-      const before = codeInput.value.slice(0, codeInput.selectionStart);
-      const partial = before.match(/[A-Za-z_]\w*$/)?.[0] || "";
-      if (suggestion && partial) {
-        codeInput.setRangeText(suggestion, codeInput.selectionStart - partial.length, codeInput.selectionStart, "end");
+      if (activeSuggestion) {
+        codeInput.setRangeText(activeSuggestion.text, codeInput.selectionStart - activeSuggestion.replace, codeInput.selectionStart, "end");
+        activeSuggestion = null;
+        showCompletion();
       } else {
         codeInput.setRangeText("    ", codeInput.selectionStart, codeInput.selectionEnd, "end");
       }
@@ -1610,6 +1734,7 @@ function init() {
   $("#close-contest-button").addEventListener("click", showHome);
   $(".brand").addEventListener("click", (event) => { event.preventDefault(); showHome(); });
   $("#home-import-button").addEventListener("click", () => $("#home-file-input").click());
+  $("#home-settings-button").addEventListener("click", () => $("#software-section").scrollIntoView({ behavior: "smooth", block: "start" }));
   $("#home-connect-button").addEventListener("click", () => {
     $("#connect-room-url").value = "";
     $("#connect-room-modal").classList.remove("hidden");

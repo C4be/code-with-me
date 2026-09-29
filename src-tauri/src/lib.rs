@@ -204,7 +204,9 @@ pub fn run() {
             open_local_room,
             create_contest,
             check_dependencies,
-            open_dependency_page,
+            install_dependency,
+            remove_managed_dependency,
+            ollama_complete,
             export_local_contest,
             delete_local_contest,
             run_local_file,
@@ -889,10 +891,13 @@ struct DependencyStatus {
     description: String,
     installed: bool,
     version: String,
+    path: String,
+    managed: bool,
 }
 
 #[tauri::command]
-fn check_dependencies() -> Vec<DependencyStatus> {
+fn check_dependencies(app: AppHandle) -> Vec<DependencyStatus> {
+    let managed = managed_dependencies(&app);
     let specs = [
         (
             "python",
@@ -908,11 +913,11 @@ fn check_dependencies() -> Vec<DependencyStatus> {
         (
             "cpp",
             "Компилятор C++",
-            "Нужен C++20; приложение ищет g++ в Windows и c++ в macOS/Linux",
+            "Нужен компилятор C++20",
             if cfg!(windows) {
-                vec!["g++"]
+                vec!["clang++", "g++"]
             } else {
-                vec!["c++", "g++", "clang++"]
+                vec!["clang++", "c++", "g++"]
             },
         ),
         (
@@ -922,10 +927,26 @@ fn check_dependencies() -> Vec<DependencyStatus> {
             vec!["javac"],
         ),
     ];
-    specs
+    let mut result: Vec<DependencyStatus> = specs
         .into_iter()
         .map(|(id, name, description, candidates)| {
-            let found = candidates.into_iter().find_map(find_executable);
+            let version_flag = if id == "go" {
+                "version"
+            } else if id == "java" {
+                "-version"
+            } else {
+                "--version"
+            };
+            let found = candidates
+                .into_iter()
+                .filter_map(find_executable)
+                .find(|path| {
+                    StdCommand::new(path)
+                        .arg(version_flag)
+                        .output()
+                        .map(|output| output.status.success())
+                        .unwrap_or(false)
+                });
             let checked = found
                 .as_ref()
                 .and_then(|path| {
@@ -963,14 +984,87 @@ fn check_dependencies() -> Vec<DependencyStatus> {
                 description: description.into(),
                 installed,
                 version: checked,
+                path: found
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                managed: managed.contains(&id.to_string()),
             }
         })
-        .collect()
+        .collect();
+    let ollama = find_executable("ollama");
+    let ollama_version = ollama
+        .as_ref()
+        .and_then(|path| StdCommand::new(path).arg("--version").output().ok())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    result.push(DependencyStatus {
+        id: "ollama".into(),
+        name: "Ollama".into(),
+        description: "Локальный движок дополнения кода".into(),
+        installed: ollama.is_some(),
+        version: ollama_version,
+        path: ollama
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        managed: managed.contains(&"ollama".to_string()),
+    });
+    let models_path = ollama_models_path();
+    let model_installed = ollama
+        .as_ref()
+        .and_then(|path| StdCommand::new(path).arg("list").output().ok())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("qwen2.5-coder:1.5b"))
+        })
+        .unwrap_or(false)
+        || models_path
+            .join("manifests/registry.ollama.ai/library/qwen2.5-coder/1.5b")
+            .is_file();
+    result.push(DependencyStatus {
+        id: "ollama-model".into(),
+        name: "Модель Qwen2.5 Coder 1.5B".into(),
+        description: "Локальные подсказки в редакторе · загрузка около 1 ГБ".into(),
+        installed: model_installed,
+        version: if model_installed {
+            "qwen2.5-coder:1.5b".into()
+        } else {
+            String::new()
+        },
+        path: models_path.display().to_string(),
+        managed: managed.contains(&"ollama-model".to_string()),
+    });
+    result
 }
 
 fn find_executable(command: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    {
+        if ["clang++", "clang", "c++"].contains(&command) {
+            directories.splice(
+                0..0,
+                ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin"].map(PathBuf::from),
+            );
+        }
+        if ["java", "javac"].contains(&command) {
+            directories.splice(
+                0..0,
+                [
+                    "/opt/homebrew/opt/openjdk/bin",
+                    "/usr/local/opt/openjdk/bin",
+                ]
+                .map(PathBuf::from),
+            );
+        }
+        directories.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    }
+    #[cfg(target_os = "linux")]
+    directories.extend(["/usr/bin", "/usr/local/bin"].map(PathBuf::from));
+    for directory in directories {
         let candidate = directory.join(command);
         if candidate.is_file() {
             return Some(candidate);
@@ -983,31 +1077,373 @@ fn find_executable(command: &str) -> Option<PathBuf> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    if command == "ollama" {
+        let path = PathBuf::from("/Applications/Ollama.app/Contents/Resources/ollama");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if command == "ollama" {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let path = PathBuf::from(local).join("Programs/Ollama/ollama.exe");
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
     None
 }
 
-#[tauri::command]
-fn open_dependency_page(id: String) -> Result<(), String> {
-    let url = match id.as_str() {
-        "python" => "https://www.python.org/downloads/",
-        "go" => "https://go.dev/dl/",
-        "cpp" if cfg!(target_os = "macos") => "https://developer.apple.com/xcode/resources/",
-        "cpp" if cfg!(target_os = "windows") => "https://www.msys2.org/",
-        "cpp" => "https://clang.llvm.org/get_started.html",
-        "java" => "https://adoptium.net/temurin/releases/",
-        _ => return Err("Неизвестная зависимость".into()),
-    };
-    #[cfg(target_os = "macos")]
-    let result = StdCommand::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let result = StdCommand::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+fn managed_file(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("managed-software.json"))
+        .map_err(|error| error.to_string())
+}
+
+fn managed_dependencies(app: &AppHandle) -> Vec<String> {
+    managed_file(app)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_managed(app: &AppHandle, ids: &[String]) -> Result<(), String> {
+    let path = managed_file(app)?;
+    std::fs::create_dir_all(path.parent().ok_or("Недопустимый путь")?)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(
+        path,
+        serde_json::to_vec(ids).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn ollama_models_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("OLLAMA_MODELS") {
+        return PathBuf::from(path);
+    }
     #[cfg(target_os = "linux")]
-    let result = StdCommand::new("xdg-open").arg(url).spawn();
-    result
-        .map(|_| ())
-        .map_err(|error| format!("Не удалось открыть страницу установки: {error}"))
+    {
+        let system = PathBuf::from("/usr/share/ollama/.ollama/models");
+        if system.exists() {
+            return system;
+        }
+    }
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    PathBuf::from(home).join(".ollama/models")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_package_manager() -> Result<String, String> {
+    ["apt-get", "dnf", "pacman"]
+        .into_iter()
+        .find(|name| find_executable(name).is_some())
+        .map(str::to_string)
+        .ok_or("Нужен apt, dnf или pacman для установки инструментов".into())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_package_name<'a>(id: &'a str, manager: &str) -> Result<&'a str, String> {
+    match (manager, id) {
+        ("apt-get", "go") => Ok("golang-go"),
+        ("apt-get", "cpp") => Ok("g++"),
+        ("apt-get", "java") => Ok("default-jdk"),
+        ("dnf", "go") => Ok("golang"),
+        ("dnf", "cpp") => Ok("gcc-c++"),
+        ("dnf", "java") => Ok("java-21-openjdk-devel"),
+        ("pacman", "go") => Ok("go"),
+        ("pacman", "cpp") => Ok("gcc"),
+        ("pacman", "java") => Ok("jdk-openjdk"),
+        ("pacman", "python") => Ok("python"),
+        (_, "python") => Ok("python3"),
+        _ => Err("Для этого дистрибутива пакет не найден".into()),
+    }
+}
+
+async fn ensure_ollama_server(path: &Path) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| error.to_string())?;
+    if client
+        .get("http://127.0.0.1:11434/api/tags")
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    Command::new(path)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Не удалось запустить Ollama: {error}"))?;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        if client
+            .get("http://127.0.0.1:11434/api/tags")
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err("Сервер Ollama не запустился. Проверьте его установку.".into())
+}
+
+fn package_name(id: &str) -> Result<&'static str, String> {
+    #[cfg(target_os = "macos")]
+    let packages = [
+        ("python", "python"),
+        ("go", "go"),
+        ("cpp", "llvm"),
+        ("java", "openjdk"),
+        ("ollama", "ollama"),
+    ];
+    #[cfg(target_os = "windows")]
+    let packages = [
+        ("python", "Python.Python.3.13"),
+        ("go", "GoLang.Go"),
+        ("cpp", "LLVM.LLVM"),
+        ("java", "EclipseAdoptium.Temurin.21.JDK"),
+        ("ollama", "Ollama.Ollama"),
+    ];
+    #[cfg(target_os = "linux")]
+    let packages = [
+        ("python", "python3"),
+        ("go", "golang-go"),
+        ("cpp", "g++"),
+        ("java", "default-jdk"),
+        ("ollama", "ollama"),
+    ];
+    packages
+        .into_iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, value)| value)
+        .ok_or("Неизвестный инструмент".into())
+}
+
+#[tauri::command]
+async fn install_dependency(app: AppHandle, id: String) -> Result<String, String> {
+    if id == "ollama-model" {
+        let ollama = find_executable("ollama").ok_or("Сначала установите Ollama")?;
+        ensure_ollama_server(&ollama).await?;
+        let output = Command::new(ollama)
+            .args(["pull", "qwen2.5-coder:1.5b"])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    } else {
+        let package = package_name(&id)?;
+        #[cfg(target_os = "linux")]
+        if id == "ollama" {
+            let response = reqwest::get("https://ollama.com/install.sh")
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("Не удалось скачать Ollama: {}", response.status()));
+            }
+            let script = response.bytes().await.map_err(|error| error.to_string())?;
+            if script.len() > 1024 * 1024 {
+                return Err("Установщик Ollama неожиданно велик".into());
+            }
+            let path = std::env::temp_dir().join(format!(
+                "code-with-me-ollama-{}.sh",
+                Uuid::new_v4().simple()
+            ));
+            tokio::fs::write(&path, script)
+                .await
+                .map_err(|error| error.to_string())?;
+            let result = Command::new("pkexec")
+                .arg("sh")
+                .arg(&path)
+                .output()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tokio::fs::remove_file(&path).await;
+            let output = result?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            let mut managed = managed_dependencies(&app);
+            if !managed.contains(&id) {
+                managed.push(id);
+                save_managed(&app, &managed)?;
+            }
+            return Ok("Ollama установлена".into());
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let brew = find_executable("brew")
+                .ok_or("Для автоматической установки на macOS нужен Homebrew")?;
+            let mut command = Command::new(brew);
+            command.args(["install", package]);
+            command
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("winget");
+            command.args([
+                "install",
+                "--id",
+                package,
+                "--exact",
+                "--source",
+                "winget",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ]);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let manager = linux_package_manager()?;
+            let package = linux_package_name(&id, &manager)?;
+            let mut command = Command::new("pkexec");
+            if manager == "pacman" {
+                command.args([manager.as_str(), "-S", "--noconfirm", package]);
+            } else {
+                command.args([manager.as_str(), "install", "-y", package]);
+            }
+            command
+        };
+        let output = command
+            .output()
+            .await
+            .map_err(|error| format!("Не удалось запустить установку: {error}"))?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Установка не завершилась: {}",
+                details.lines().last().unwrap_or("неизвестная ошибка")
+            ));
+        }
+    }
+    let mut managed = managed_dependencies(&app);
+    if !managed.contains(&id) {
+        managed.push(id.clone());
+        save_managed(&app, &managed)?;
+    }
+    Ok(
+        "Установка завершена. Если инструмент не появился в списке, перезапустите приложение."
+            .into(),
+    )
+}
+
+#[tauri::command]
+async fn remove_managed_dependency(app: AppHandle, id: String) -> Result<(), String> {
+    let mut managed = managed_dependencies(&app);
+    if !managed.contains(&id) {
+        return Err("Этот инструмент установлен вне приложения; его файлы не будут удалены".into());
+    }
+    if id == "ollama" && managed.contains(&"ollama-model".to_string()) {
+        return Err("Сначала очистите модель Ollama в настройках".into());
+    }
+    if id == "ollama-model" {
+        let ollama = find_executable("ollama").ok_or("Ollama не найдена")?;
+        ensure_ollama_server(&ollama).await?;
+        let output = Command::new(ollama)
+            .args(["rm", "qwen2.5-coder:1.5b"])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    } else {
+        let package = package_name(&id)?;
+        #[cfg(target_os = "linux")]
+        if id == "ollama" {
+            let mut script = String::from("systemctl stop ollama 2>/dev/null || true\nsystemctl disable ollama 2>/dev/null || true\n");
+            script.push_str("rm -f /etc/systemd/system/ollama.service /usr/local/bin/ollama /usr/bin/ollama\nrm -rf /usr/local/lib/ollama /usr/lib/ollama\nsystemctl daemon-reload 2>/dev/null || true\n");
+            let output = Command::new("pkexec")
+                .args(["sh", "-c", &script])
+                .output()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            managed.retain(|item| item != &id);
+            return save_managed(&app, &managed);
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let brew = find_executable("brew").ok_or("Homebrew не найден")?;
+            let mut command = Command::new(brew);
+            command.args(["uninstall", package]);
+            command
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("winget");
+            command.args([
+                "uninstall",
+                "--id",
+                package,
+                "--exact",
+                "--source",
+                "winget",
+            ]);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let manager = linux_package_manager()?;
+            let package = linux_package_name(&id, &manager)?;
+            let mut command = Command::new("pkexec");
+            if manager == "pacman" {
+                command.args([manager.as_str(), "-R", "--noconfirm", package]);
+            } else {
+                command.args([manager.as_str(), "remove", "-y", package]);
+            }
+            command
+        };
+        let output = command.output().await.map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    }
+    managed.retain(|item| item != &id);
+    save_managed(&app, &managed)
+}
+
+#[tauri::command]
+async fn ollama_complete(
+    prefix: String,
+    suffix: String,
+    language: String,
+) -> Result<String, String> {
+    let ollama = find_executable("ollama").ok_or("Ollama не установлена")?;
+    ensure_ollama_server(&ollama).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(35))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client.post("http://127.0.0.1:11434/api/generate")
+        .json(&json!({"model":"qwen2.5-coder:1.5b", "system": format!("Продолжи код на {language}. Верни только продолжение без пояснений."), "prompt": prefix.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>(), "suffix": suffix.chars().take(2000).collect::<String>(), "stream": false, "options": {"temperature": 0.1, "num_predict": 96}}))
+        .send().await.map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama ответила: {}", response.status()));
+    }
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    Ok(body
+        .get("response")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 #[tauri::command]
@@ -1059,9 +1495,7 @@ fn create_contest(
 }
 
 #[tauri::command]
-async fn start_room(
-    manager: TauriState<'_, RoomManager>,
-) -> Result<RoomInfo, String> {
+async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, String> {
     let already_running = {
         manager
             .running
@@ -1185,7 +1619,10 @@ async fn stop_room(manager: TauriState<'_, RoomManager>) -> Result<(), String> {
     if let Some(room) = room {
         let _ = room.stop.send(());
         let _ = reqwest::Client::new()
-            .delete(format!("{}/api/rooms/{}", room.data.rendezvous_base, room.data.info.room_id))
+            .delete(format!(
+                "{}/api/rooms/{}",
+                room.data.rendezvous_base, room.data.info.room_id
+            ))
             .header("X-Host-Secret", &room.data.host_secret)
             .timeout(Duration::from_secs(5))
             .send()
@@ -1612,13 +2049,26 @@ async fn execute_isolated_file(root: &Path, path: &Path) -> Result<RunResult, St
     match ext.as_str() {
         "py" => {
             execute(
-                Command::new(if cfg!(windows) { "python" } else { "python3" })
+                Command::new(
+                    find_executable(if cfg!(windows) { "python" } else { "python3" })
+                        .unwrap_or_else(|| {
+                            PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+                        }),
+                )
+                .arg(path)
+                .current_dir(root),
+            )
+            .await
+        }
+        "go" => {
+            execute(
+                Command::new(find_executable("go").unwrap_or_else(|| PathBuf::from("go")))
+                    .arg("run")
                     .arg(path)
                     .current_dir(root),
             )
             .await
         }
-        "go" => execute(Command::new("go").arg("run").arg(path).current_dir(root)).await,
         "cpp" | "cc" | "cxx" => compile_and_run_cpp(root, path).await,
         "java" => compile_and_run_java(root, path).await,
         _ => Err("Поддерживаются Python, Go, C++ и Java".into()),
@@ -1659,7 +2109,17 @@ async fn compile_and_run_cpp(root: &Path, source: &Path) -> Result<RunResult, St
     } else {
         "solution"
     });
-    let compiler = if cfg!(windows) { "g++" } else { "c++" };
+    let compiler = ["clang++", "c++", "g++"]
+        .into_iter()
+        .filter_map(find_executable)
+        .find(|path| {
+            StdCommand::new(path)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+        .ok_or("Компилятор C++ не найден")?;
     let compile = execute(
         Command::new(compiler)
             .arg("-std=c++20")
@@ -1712,7 +2172,7 @@ async fn compile_and_run_java(root: &Path, source: &Path) -> Result<RunResult, S
             .map_err(|error| error.to_string())?;
     }
     let compile = execute(
-        Command::new("javac")
+        Command::new(find_executable("javac").unwrap_or_else(|| PathBuf::from("javac")))
             .arg("-d")
             .arg(&build)
             .arg(&compile_source)
@@ -1723,7 +2183,7 @@ async fn compile_and_run_java(root: &Path, source: &Path) -> Result<RunResult, S
         return Ok(compile);
     }
     execute(
-        Command::new("java")
+        Command::new(find_executable("java").unwrap_or_else(|| PathBuf::from("java")))
             .arg("-cp")
             .arg(build)
             .arg(class_name)
@@ -1793,7 +2253,9 @@ async fn handle_socket(
     }
     let (mut sender, mut receiver) = socket.split();
     let mut visible_room = room_info(&room).await;
-    if !is_host { visible_room.local_base = None; }
+    if !is_host {
+        visible_room.local_base = None;
+    }
     let ready = json!({"type":"room:ready", "id":id, "name":name, "room":visible_room});
     if sender
         .send(Message::Text(ready.to_string().into()))

@@ -1474,7 +1474,7 @@ async fn start_public_tunnel(executable: &Path, port: u16) -> Result<(String, Ch
         .arg("tunnel")
         .arg("--no-autoupdate")
         .arg("--protocol")
-        .arg("http2")
+        .arg("auto")
         .arg("--url")
         .arg(origin)
         .stdout(Stdio::piped())

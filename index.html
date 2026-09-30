@@ -33,6 +33,7 @@
           </button>
           <button class="profile-button" id="profile-button" type="button" title="Изменить имя">Вы: <span id="profile-name">Участник</span></button>
           <span class="room-state room-idle" id="room-state"><i></i><span>Локальная комната</span></span>
+          <button class="button secondary hidden" id="network-diagnostics-button" type="button">Сеть</button>
           <div class="participants" id="participants" aria-label="Участники комнаты"><span class="people-count">0 / 10</span></div>
           <button class="button secondary" id="lesson-button">Сохранить занятие</button>
           <button class="button secondary hidden" id="invite-button" disabled>Пригласить</button>
@@ -180,6 +181,17 @@
             <button class="button primary" id="save-disconnected-button">Сохранить контест</button>
             <button class="button secondary" id="leave-disconnected-button">Выйти без сохранения</button>
           </div>
+        </div>
+      </div>
+
+      <div class="modal-backdrop hidden" id="network-modal" role="dialog" aria-modal="true" aria-labelledby="network-title">
+        <div class="modal-card network-card">
+          <div class="modal-header"><div><span>СОЕДИНЕНИЕ</span><h2 id="network-title">Диагностика сети</h2></div><button data-close-modal="network-modal" aria-label="Закрыть">×</button></div>
+          <p id="network-summary">Ожидаем подключение участника.</p>
+          <p id="network-ice-detail"></p>
+          <p>Типы кандидатов и проверки ICE помогут понять, почему выбран прямой маршрут или TURN. Адреса устройств в отчёт не включены.</p>
+          <pre id="network-report"></pre>
+          <div class="modal-actions"><button class="button secondary" id="copy-network-report" type="button">Скопировать отчёт</button></div>
         </div>
       </div>
 

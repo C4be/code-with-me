@@ -80,6 +80,9 @@ const liveTimers = new Map();
 const pendingWrites = new Map();
 const localRevisions = new Map();
 const seenRemoteRevisions = new Map();
+const localEditAt = new Map();
+const syncConflicts = new Set();
+const editTrace = [];
 const presence = new Map();
 const remoteActivity = new Map();
 let presenceTimer = 0;
@@ -97,6 +100,10 @@ const roomState = {
   selfName: "",
   participants: [],
   peerRoutes: new Map(),
+  peerDiagnostics: new Map(),
+  guestDiagnostics: null,
+  diagnosticRole: "",
+  hostPersistsCode: false,
 };
 
 const codeInput = $("#code-input");
@@ -746,14 +753,14 @@ function sendPresence(active = true) {
 
 function sendLiveChange(path) {
   if (!roomState.code || !roomState.socket || roomState.socket.readyState !== WebSocket.OPEN) return;
-  const revision = (localRevisions.get(path) || 0) + 1;
-  localRevisions.set(path, revision);
-  clearTimeout(liveTimers.get(path));
+  localRevisions.set(path, (localRevisions.get(path) || 0) + 1);
+  if (liveTimers.has(path)) return;
+  const intervalMs = (files[path] || "").length > 65536 ? 100 : 20;
   liveTimers.set(path, setTimeout(() => {
     liveTimers.delete(path);
     if (roomState.socket?.readyState !== WebSocket.OPEN) return;
-    roomState.socket.send(JSON.stringify({ type: "code:change", path, content: files[path], revision }));
-  }, 35));
+    roomState.socket.send(JSON.stringify({ type: "code:change", path, content: files[path], revision: localRevisions.get(path), protocolVersion: 2 }));
+  }, intervalMs));
 }
 
 function activateSolution(path, selectTask = true) {
@@ -833,6 +840,7 @@ async function loadWorkspace() {
 
 async function persistFile(path, content, revision = localRevisions.get(path)) {
   const roomCode = roomState.code;
+  if (roomCode && !roomState.host && roomState.hostPersistsCode && isCodeFile(path)) return;
   const previous = pendingWrites.get(path) || Promise.resolve();
   const write = previous.catch(() => {}).then(() => {
     if (roomCode) {
@@ -851,6 +859,7 @@ async function persistFile(path, content, revision = localRevisions.get(path)) {
 }
 
 function schedulePersist(path, content, isTask = false) {
+  if (roomState.code && !roomState.host && roomState.hostPersistsCode && isCodeFile(path)) return;
   if (roomState.disconnected && !window.__TAURI__?.core?.invoke) {
     $("#sync-state").textContent = "● Новые правки не сохранены";
     if (isTask) $("#task-save-state").textContent = "● Не сохранено";
@@ -1129,13 +1138,14 @@ async function runCode() {
 
 function setRoomChrome(label, online, local = false, detail = "") {
   document.body.classList.toggle("is-browser-guest", !window.__TAURI__?.core?.invoke && (online || roomState.disconnected));
-  $("#sync-state").textContent = online ? "● Синхронизировано" : roomState.disconnected ? "● Сохраните контест" : "● Локально";
+  $("#sync-state").textContent = online && syncConflicts.size ? "● Конфликт правок" : online ? "● Синхронизировано" : roomState.disconnected ? "● Сохраните контест" : "● Локально";
   if (roomState.disconnected) $("#task-save-state").textContent = "● Только в этом окне";
   const state = $("#room-state");
   state.classList.toggle("room-idle", !online);
   state.querySelector("span").textContent = label;
   state.title = detail;
   const mayInvite = online && roomState.host;
+  $("#network-diagnostics-button").classList.toggle("hidden", !online && !roomState.peerDiagnostics.size && !roomState.guestDiagnostics);
   $("#invite-button").disabled = !mayInvite;
   $("#invite-button").classList.toggle("hidden", !mayInvite);
   $("#start-room-button").classList.toggle("hidden", online || !window.__TAURI__?.core?.invoke);
@@ -1150,8 +1160,9 @@ function updateHostRouteChrome() {
   if (!routes.length) { setRoomChrome("Комната запущена", true); return; }
   const direct = routes.filter((route) => route.kind === "direct").length;
   const relay = routes.length - direct;
+  const applicationRtt = routes.length === 1 ? roomState.peerDiagnostics.get(roomState.peerRoutes.keys().next().value)?.applicationRttMs : null;
   const label = routes.length === 1
-    ? direct ? "Гость напрямую" : "Гость через сервер"
+    ? `${direct ? "Гость напрямую" : "Гость через сервер"}${applicationRtt === null || applicationRtt === undefined ? "" : ` · ${applicationRtt} мс`}`
     : `${direct} напрямую · ${relay} через сервер`;
   const detail = routes.map((route) => `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`).join("; ");
   setRoomChrome(label, true, false, detail);
@@ -1162,6 +1173,10 @@ function applyRoomFileEvent(message) {
   if (typeof path !== "string" || typeof message.content !== "string") return;
   const writer = message.participantId || message.writer;
   if (writer && writer === roomState.participantId) return;
+  if (message.type === "file:saved" && isCodeFile(path)) {
+    traceEdit({ type: "saved-snapshot-ignored", path, writer, revision: message.revision });
+    return;
+  }
   if (writer && message.type === "code:change") remoteActivity.set(writer, Date.now());
   const revision = Number(message.revision) || 0;
   const revisionKey = writer ? `${writer}\0${path}` : "";
@@ -1169,19 +1184,87 @@ function applyRoomFileEvent(message) {
     if (revision <= (seenRemoteRevisions.get(revisionKey) || 0)) return;
     seenRemoteRevisions.set(revisionKey, revision);
   }
+  const current = files[path] || "";
+  const localAgeMs = Date.now() - (localEditAt.get(path) || 0);
+  if (message.type === "code:change" && localAgeMs < 1500 && removesRecentText(current, message.content)) {
+    traceEdit({ type: "incoming-conflict", path, writer, revision, oldLength: current.length, incomingLength: message.content.length, localAgeMs });
+    if (!syncConflicts.has(path)) showToast("Одновременные правки: локальный текст сохранён. Сверьте решения с участником.", 6000);
+    syncConflicts.add(path);
+    $("#sync-state").textContent = "● Конфликт правок";
+    return;
+  }
+  traceEdit({ type: "remote-applied", path, writer, revision, oldLength: current.length, incomingLength: message.content.length, localAgeMs });
+  if (message.content === current) syncConflicts.delete(path);
   files[path] = message.content;
+  if (roomState.host && message.type === "code:change" && Number(message.protocolVersion) >= 2 && isCodeFile(path)) schedulePersist(path, message.content);
   if (path === activeFile && codeInput.value !== message.content) syncEditorFromRemote(message.content);
   renderRemoteCursors();
   if (path === currentTaskFile && !$("#task-form").contains(document.activeElement) && document.activeElement !== $("#task-source-input")) renderTask();
 }
 
+function traceEdit(entry) {
+  editTrace.push({ time: new Date().toISOString(), ...entry });
+  if (editTrace.length > 100) editTrace.splice(0, editTrace.length - 100);
+}
+
+function removesRecentText(current, incoming) {
+  if (incoming.length >= current.length || current.length - incoming.length > 32) return false;
+  let prefix = 0;
+  while (prefix < incoming.length && current[prefix] === incoming[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < incoming.length - prefix && current[current.length - suffix - 1] === incoming[incoming.length - suffix - 1]) suffix++;
+  return prefix + suffix === incoming.length;
+}
+
+function networkDiagnosticData() {
+  return {
+    capturedAt: new Date().toISOString(),
+    role: roomState.diagnosticRole,
+    conflictedFiles: [...syncConflicts],
+    recentEdits: editTrace.slice(-50),
+    peers: roomState.diagnosticRole === "host"
+      ? [...roomState.peerDiagnostics].map(([id, report]) => ({ peerId: id, ...report }))
+      : roomState.guestDiagnostics ? [roomState.guestDiagnostics] : [],
+  };
+}
+
+function renderNetworkDiagnostics() {
+  const report = networkDiagnosticData();
+  const peer = report.peers[0];
+  const route = peer?.selectedRoute;
+  const measuredRtt = peer?.applicationRttMs ?? route?.rttMs ?? "—";
+  $("#network-summary").textContent = syncConflicts.size
+    ? `Обнаружены одновременные правки: ${[...syncConflicts].join(", ")}. Локальный ввод сохранён; версии требуют сверки.`
+    : !peer
+    ? "Ожидаем подключение участника."
+    : route?.kind === "direct"
+      ? `Прямое соединение · RTT приложения ${measuredRtt} мс`
+      : route?.kind === "relay"
+        ? `Через TURN-сервер · RTT приложения ${measuredRtt} мс. Если устройства в одной Wi-Fi сети, проверьте доступ к локальной сети в настройках VPN.`
+        : "Проверяем доступные маршруты.";
+  const directCandidates = peer ? Object.entries(peer.localCandidates || {})
+    .filter(([type]) => /^(host|srflx|prflx)\//.test(type))
+    .reduce((sum, [, count]) => sum + count, 0) : 0;
+  $("#network-ice-detail").textContent = peer
+    ? `Прямых кандидатов: ${directCandidates} · прямых пар в статистике: ${peer.directPairsObserved ?? "—"} · ICE-запросов: ${peer.directChecksSent ?? "нет данных"} · ответов: ${peer.directResponsesReceived ?? "нет данных"}`
+    : "";
+  $("#network-report").textContent = JSON.stringify(report, null, 2);
+}
+
 async function connectRoom(info, host = false, guestName = "") {
+  localEditAt.clear();
+  syncConflicts.clear();
+  editTrace.length = 0;
   roomState.local = false;
   roomState.disconnected = false;
   roomState.base = host && info.localBase ? info.localBase : new URL(info.inviteUrl).origin;
   roomState.code = info.inviteCode;
   roomState.inviteUrl = info.inviteUrl;
   roomState.host = host;
+  roomState.hostPersistsCode = host && Number(info.protocolVersion) >= 2;
+  roomState.peerDiagnostics.clear();
+  roomState.guestDiagnostics = null;
+  roomState.diagnosticRole = host ? "host" : "guest";
   roomState.selfName = host ? savedName() : guestName.trim().slice(0, 40) || savedName();
   roomState.participants = info.participants || [];
   setRoomChrome(host ? "Комната запущена" : "Вы в комнате", true);
@@ -1201,6 +1284,12 @@ async function connectRoom(info, host = false, guestName = "") {
       roomState.peerRoutes.delete(id);
       if (roomState.transport === bridge) updateHostRouteChrome();
     };
+    bridge.onDiagnostics = (id, report) => {
+      if (roomState.transport !== bridge) return;
+      roomState.peerDiagnostics.set(id, report);
+      if (roomState.peerRoutes.has(id) && report.applicationRttMs !== null) updateHostRouteChrome();
+      if (!$("#network-modal").classList.contains("hidden")) renderNetworkDiagnostics();
+    };
     await bridge.connect();
     roomState.transport = bridge;
     const socketUrl = new URL("/ws", roomState.base);
@@ -1217,6 +1306,15 @@ async function connectRoom(info, host = false, guestName = "") {
       const detail = `${route.localType} ↔ ${route.remoteType}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`;
       setRoomChrome(`${route.kind === "relay" ? "Через сервер" : "Напрямую"}${route.rttMs === null ? "" : ` · ${route.rttMs} мс`}`, true, false, detail);
     };
+    transport.onDiagnostics = (report) => {
+      if (roomState.transport !== transport) return;
+      roomState.guestDiagnostics = report;
+      if (report.selectedRoute && report.applicationRttMs !== null) {
+        const route = report.selectedRoute;
+        setRoomChrome(`${route.kind === "relay" ? "Через сервер" : "Напрямую"} · ${report.applicationRttMs} мс`, true, false, `RTT приложения: ${report.applicationRttMs} мс; ICE: ${route.rttMs ?? "—"} мс`);
+      }
+      if (!$("#network-modal").classList.contains("hidden")) renderNetworkDiagnostics();
+    };
     roomState.transport = transport;
     socket = await transport.connect(roomState.selfName);
   }
@@ -1230,6 +1328,7 @@ async function connectRoom(info, host = false, guestName = "") {
       if (message.type === "room:ready") {
         roomState.participantId = message.id;
         roomState.selfName = message.name;
+        roomState.hostPersistsCode = Number(message.room?.protocolVersion) >= 2;
         renderRoomParticipants(message.room.participants || []);
         try {
           await loadWorkspace();
@@ -1316,6 +1415,7 @@ function resetRoomConnection() {
   roomState.code = "";
   roomState.inviteUrl = "";
   roomState.host = false;
+  roomState.hostPersistsCode = false;
   roomState.disconnected = false;
   roomState.participantId = "";
   roomState.participants = [];
@@ -1891,12 +1991,14 @@ function init() {
   codeInput.addEventListener("input", () => {
     if (!activeFile) return;
     files[activeFile] = codeInput.value;
+    localEditAt.set(activeFile, Date.now());
     $("#highlight-code").innerHTML = `${highlight(codeInput.value)}\n`;
     const count = Math.max(1, codeInput.value.split("\n").length);
     $("#line-numbers").innerHTML = Array.from({ length: count }, (_, index) => index + 1).join("<br>");
     codeInput.style.height = `${Math.max($("#code-wrap").clientHeight - 35, count * editorLineHeight())}px`;
     schedulePersist(activeFile, codeInput.value);
     sendLiveChange(activeFile);
+    traceEdit({ type: "local", path: activeFile, revision: localRevisions.get(activeFile) || 0, length: codeInput.value.length });
     updateCursorStatus();
     updateCompletion();
     sendPresence();
@@ -1930,6 +2032,18 @@ function init() {
   $("#copy-invite-button").addEventListener("click", copyInvite);
   $("#join-form").addEventListener("submit", submitJoin);
   $("#lesson-button").addEventListener("click", () => $("#lesson-modal").classList.remove("hidden"));
+  $("#network-diagnostics-button").addEventListener("click", () => {
+    renderNetworkDiagnostics();
+    $("#network-modal").classList.remove("hidden");
+  });
+  $("#copy-network-report").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(networkDiagnosticData(), null, 2));
+      showToast("Отчёт о соединении скопирован");
+    } catch (error) {
+      showToast(`Не удалось скопировать отчёт: ${error.message || error}`);
+    }
+  });
   $("#save-disconnected-button").addEventListener("click", saveDisconnectedContest);
   $("#leave-disconnected-button").addEventListener("click", leaveDisconnectedRoom);
   $$("[data-export-mode]").forEach((button) => button.addEventListener("click", () => exportLesson(button.dataset.exportMode)));

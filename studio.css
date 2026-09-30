@@ -74,6 +74,9 @@ button { border: 0; cursor: pointer; }
 .room-state { height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius: 15px; color: var(--accent); background: var(--accent-soft); font-size: 9px; white-space: nowrap; }
 .room-state i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .room-state.room-idle { color: var(--muted); background: var(--surface-hover); border-color: var(--line); }
+.network-card { width: min(650px, 100%); }
+.network-card p { margin: 0 0 10px; color: var(--soft); font-size: 11px; line-height: 1.5; }
+.network-card pre { max-height: min(50vh, 430px); overflow: auto; padding: 12px; border-radius: 8px; background: var(--surface-hover); color: var(--text); font: 10px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .participants { display: flex; align-items: center; padding-left: 4px; }
 .avatar { width: 25px; height: 25px; margin-left: -6px; display: inline-grid; place-items: center; border: 2px solid var(--page); border-radius: 50%; color: #22252a; font-size: 9px; font-weight: 800; background: #a9d4fa; }
 .avatar:nth-child(2n) { background: #ccb8f2; }

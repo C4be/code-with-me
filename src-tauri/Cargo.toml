@@ -1,6 +1,6 @@
 [package]
 name = "code-with-me"
-version = "0.1.1"
+version = "0.1.2"
 description = "Code with me desktop app"
 authors = ["Code with me"]
 edition = "2021"

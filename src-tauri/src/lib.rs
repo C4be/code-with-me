@@ -54,6 +54,7 @@ struct RoomInfo {
     port: u16,
     participant_count: usize,
     max_participants: usize,
+    protocol_version: u8,
     participants: Vec<ParticipantView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_secret: Option<String>,
@@ -1574,6 +1575,7 @@ async fn start_room(manager: TauriState<'_, RoomManager>) -> Result<RoomInfo, St
         port: 443,
         participant_count: 1,
         max_participants: MAX_PARTICIPANTS,
+        protocol_version: 2,
         participants: vec![ParticipantView {
             id: host_id,
             name: "Хозяин комнаты".into(),
